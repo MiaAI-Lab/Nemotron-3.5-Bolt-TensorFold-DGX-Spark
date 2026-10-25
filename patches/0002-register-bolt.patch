@@ -1,6 +1,6 @@
 diff --git a/zig/build/bolt.zig b/zig/build/bolt.zig
 new file mode 100644
-index 00000000..f56d6246
+index 000000000..873f58ff4
 --- /dev/null
 +++ b/zig/build/bolt.zig
 @@ -0,0 +1,27 @@
@@ -32,7 +32,7 @@ index 00000000..f56d6246
 +    step.dependOn(&b.addInstallFile(lib, "native/lib/libbolt.so").step);
 +}
 diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
-index 5fadb17f..1e1b1f31 100644
+index c83d97f21..8b3499252 100644
 --- a/zig/build/cuda.zig
 +++ b/zig/build/cuda.zig
 @@ -2,6 +2,7 @@
@@ -41,17 +41,17 @@ index 5fadb17f..1e1b1f31 100644
  const golden_build = @import("golden.zig");
 +const bolt_build = @import("bolt.zig");
  const catalog = @import("cuda_kernels.zig");
- const Kernel = catalog.Kernel;
- const torch_flags = catalog.torch_flags;
-@@ -52,6 +53,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
-     const prebuilt = b.option([]const u8, "fatbins", "absolute directory of prebuilt <name>.fatbin files to embed");
-     const sms = b.option([]const u8, "sm", "SASS targets, comma separated (default 121; 80, 86, 89, 120 and 121 build)") orelse "121";
-     const strip = b.option(bool, "strip", "No debug info in the CUDA executables: no build machine paths leave with them") orelse false;
+ pub const Kernel = catalog.Kernel;
+ pub const kernels = catalog.kernels;
+@@ -46,6 +47,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const prebuilt = opts.fatbins;
+     const sms = opts.sms;
+     const strip = opts.strip;
 +    bolt_build.steps(b, nvcc);
      // the compiler's version text is an input of every fatbin, so a new nvcc rebuilds them all
      const version: ?std.Build.LazyPath = if (prebuilt == null and nvcc != null) blk: {
          const run = b.addSystemCommand(&.{ nvcc.?, "--version" });
-@@ -319,6 +321,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+@@ -352,6 +354,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
      }) });
      bolt.dependOn(&compile_bolt.step);
      step.dependOn(&compile_bolt.step);
@@ -67,7 +67,7 @@ index 5fadb17f..1e1b1f31 100644
          bolt.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
      const video_step = b.step("test-omni-video-host", "Actual RADIO and Bolt video boundaries without a GPU or decoder library");
 diff --git a/zig/src/cli/hub.zig b/zig/src/cli/hub.zig
-index 4a90bace..9af3344b 100644
+index 4896d3b34..009ca2710 100644
 --- a/zig/src/cli/hub.zig
 +++ b/zig/src/cli/hub.zig
 @@ -11,6 +11,7 @@ pub const Family = struct { model_type: []const u8, title: []const u8, formats:
@@ -99,7 +99,7 @@ index 4a90bace..9af3344b 100644
  }
  
  /// config.json's quantization: bits and group size, when the checkpoint is MLX-affine quantized.
-@@ -196,6 +201,12 @@ test "cache layout helpers read a synthetic cache" {
+@@ -221,6 +226,12 @@ test "cache layout helpers read a synthetic cache" {
      const snapshot = (try cachedSnapshot(a, io, hub, "Org/Name")).?;
      try std.testing.expect(std.mem.endsWith(u8, snapshot, "0123456789abcdef0123456789abcdef01234567"));
      try std.testing.expectEqualStrings("qwen4_exp", modelType(a, io, snapshot));
@@ -113,10 +113,10 @@ index 4a90bace..9af3344b 100644
      try std.testing.expectEqual(@as(u64, 6), q.bits);
      try std.testing.expectEqual(@as(u64, 32), q.group);
 diff --git a/zig/src/families/nemotron/cuda.zig b/zig/src/families/nemotron/cuda.zig
-index c221b283..1fe058b9 100644
+index 0d9304f20..1e3404fa3 100644
 --- a/zig/src/families/nemotron/cuda.zig
 +++ b/zig/src/families/nemotron/cuda.zig
-@@ -33,6 +33,8 @@ pub const pages = @import("cuda_pages.zig");
+@@ -34,6 +34,8 @@ pub const pages = @import("cuda_pages.zig");
  pub const slide = @import("cuda_slide.zig");
  pub const worker = @import("cuda_worker.zig");
  pub const omni = @import("cuda_native_omni.zig");
@@ -126,35 +126,23 @@ index c221b283..1fe058b9 100644
  
  test {
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index 84f106a0..b3d1b122 100644
+index 0d4287d6f..3b5258292 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
-@@ -24,7 +24,7 @@ const vision_offer = @import("cuda_vision_offer.zig");
+@@ -26,7 +26,7 @@ const vision_offer = @import("cuda_vision_offer.zig");
  const drafted = @import("cuda_drafted.zig");
  const kv_pages = @import("cuda_kv_pool.zig");
  /// CUDA families provide metadata, open their lane backend and explain their refusals.
--const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native };
-+const registry = .{ nemotron.native, nemotron.omni, nemotron.bolt, glm.native, qwen35.native, qwen35.native_moe, flashnext.native };
+-const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31 };
++const registry = .{ nemotron.native, nemotron.omni, nemotron.bolt, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31 };
  /// --record opens here (engines.zig refuses it for a backend without this).
  pub const records = true;
  pub const backends: []const []const u8 = &.{"cuda"};
-diff --git a/zig/src/native/cuda_options.zig b/zig/src/native/cuda_options.zig
-index 9f18f404..2de9cb23 100644
---- a/zig/src/native/cuda_options.zig
-+++ b/zig/src/native/cuda_options.zig
-@@ -34,6 +34,7 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
-     if (comptime @hasField(F.Options, "drafter")) opts.drafter = o.drafter;
-     if (comptime @hasField(F.Options, "drafter_bits")) opts.drafter_bits = o.drafter_bits;
-     if (@hasField(F.Options, "kv8")) opts.kv8 = o.kv8;
-+    if (@hasField(F.Options, "lanes")) opts.lanes = o.lanes; // a family that keeps one sequence of state per stream
-     return true;
- }
- 
 diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
-index f1cceb9e..5a791949 100644
+index 5dab0c456..57b19e056 100644
 --- a/zig/src/server/main.zig
 +++ b/zig/src/server/main.zig
-@@ -168,7 +168,12 @@ fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8, problem: *[]cons
+@@ -201,7 +201,12 @@ fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8, problem: *[]cons
      const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return "unknown";
      if (doc != .object) return "unknown";
      const t = doc.object.get("model_type") orelse return "unknown";
@@ -170,7 +158,7 @@ index f1cceb9e..5a791949 100644
  /// generation_config.json's sampling (``do_sample`` false is greedy), then the serve flags over it.
 diff --git a/zig/tests/bolt_lib_compile.zig b/zig/tests/bolt_lib_compile.zig
 new file mode 100644
-index 00000000..a677fe85
+index 000000000..a677fe857
 --- /dev/null
 +++ b/zig/tests/bolt_lib_compile.zig
 @@ -0,0 +1,11 @@

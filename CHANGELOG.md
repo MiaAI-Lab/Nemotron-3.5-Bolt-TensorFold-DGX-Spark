@@ -1,7 +1,7 @@
 # Changelog
 
-Newest first. This recipe targets one DGX Spark. The image is `tensorfold-nemotron-bolt:zig-76aafcf`, built by
-`scripts/prepare.sh` from TensorFold `76aafcf2` (v1.1.0) plus `patches/`.
+Newest first. This recipe targets one DGX Spark. The image is `tensorfold-nemotron-bolt:zig-eab8582`, built by
+`scripts/prepare.sh` from TensorFold `eab8582` (v1.1.4) plus `patches/`.
 
 ## Unreleased
 
@@ -9,6 +9,22 @@ The Bolt backend serves the checkpoint. Measured on one GB10 (this build, 2026-1
 and 137 code with LiLiCorr (71 and 133 sampled; 4.3 to 36 without drafts), prefill 2,310 to 2,510 tok/s from 2.7k to
 42k tokens, 2,255 at 63k and 1,975 at 126k (NV4_FP4=0: about 7 % less); sixteen streams at once 284 tok/s aggregate
 greedy prose, 385 code, 251 and 280 sampled.
+
+### TensorFold 1.1.4
+
+- **Rebased onto TensorFold v1.1.4** (`eab8582`). `TF_REF` now pins the release commit.
+- Dropped `0001-vision-image-tokens.patch`: upstream now accepts up to 262144 image tokens.
+- Backported upstream's `91eab7d0`, "cuda contract: the softcap control includes the act_round helpers it calls", as
+  `0001-contract-controls-include.patch`. Drop it when `TF_REF` includes `91eab7d0`; no test is skipped.
+- Backported upstream's `f70f50bad`, "test(cuda): pass the current W4A8 exceptional-input verdict", as
+  `0003-w4a8-test-verdict.patch`. The CUDA test now passes the device flag and checks the host verdict with the current
+  prompt API, retaining its comparisons. Drop it when `TF_REF` includes `f70f50bad`.
+- Rebased `0002-register-bolt.patch`: the build hook uses upstream's CUDA options, and the registry retains its new
+  families beside libbolt. The `cuda_options.zig` hunk is gone because upstream already passes `lanes` to families.
+  The libbolt build target, backend compile check, family export, hub entry and puzzle-model routing are retained.
+- The Dockerfile reads xgrammar's pin from `zig/src/platform/grammar_library.zig`; upstream now installs libtfgrammar
+  directly into `native/lib`, so the copy from the old `lib` location is gone.
+- The measured results below remain from their recorded runs; this rebase adds no GPU measurements.
 
 ### Prompt attention 2.2 to 2.5× at long context, and the fp4 kernel at 154 TFLOPS
 

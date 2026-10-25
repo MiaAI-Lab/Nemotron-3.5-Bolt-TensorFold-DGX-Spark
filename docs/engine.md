@@ -1,6 +1,6 @@
 # The Bolt backend and engine
 
-`./start.sh` builds TensorFold at `76aafcf2` (v1.1.0), applies `patches/`, copies `engine/bolt_native.zig` and `engine/bolt_api.zig` into
+`./start.sh` builds TensorFold at `eab8582` (v1.1.4), applies upstream CUDA build fixes and Bolt registration in `patches/`, copies `engine/bolt_native.zig` and `engine/bolt_api.zig` into
 `zig/src/families/nemotron/` and compiles `engine/*.cu` into `/opt/tensorfold/lib/libbolt.so`. `tensorfold-native`
 opens the checkpoint through the `nemotron_h_puzzle` family that `patches/0002` registers, loads libbolt from its own `lib/` and serves.
 

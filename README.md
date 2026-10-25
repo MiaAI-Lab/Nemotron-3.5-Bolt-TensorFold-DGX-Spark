@@ -208,7 +208,7 @@ cd Nemotron-3.5-Bolt-TensorFold-DGX-Spark
 ./start.sh
 ```
 
-The first run builds TensorFold at `76aafcf2` (v1.1.0) with `patches/` and the engine in `engine/`, downloads the checkpoint
+The first run builds TensorFold at `eab8582` (v1.1.4) with `patches/` and the engine in `engine/`, downloads the checkpoint
 (23 GiB) and the LiLiCorr drafter (1.3 GB), checks them, starts the server and sends a smoke request. Later runs
 reuse the image and the snapshots. Loading takes about 45 seconds with the files in the page cache.
 
@@ -242,9 +242,9 @@ defaults (`./start.sh restart --context 131072`). `DRY_RUN=1` prints the docker 
 **`scripts/prepare.sh`:**
 
 1. Preflight: Docker, disk, `MemAvailable`.
-2. The image `tensorfold-nemotron-bolt:zig-76aafcf`: TensorFold at `TF_REF` with every `patches/*.patch` applied,
-   `zig test zig/src/families/nemotron/config.zig`, Zig 0.17.0, on `nvcr.io/nvidia/pytorch:26.07-py3`, then
-   `zig build -Dnvcc=… install native`. It tries a prebuilt image from GitHub Container Registry first
+2. The image `tensorfold-nemotron-bolt:zig-eab8582`: TensorFold at `TF_REF` with every `patches/*.patch` applied,
+   Zig 0.17.0 on `nvcr.io/nvidia/pytorch:26.07-py3`, and `zig build -Dnvcc=… install native bolt video grammar`.
+   The Dockerfile checks the installed server and libraries. It tries a prebuilt image from GitHub Container Registry first
    (`PULL=0` builds locally). No image is published for this revision, so the first run builds.
 3. The checkpoint, at the pinned revision.
 4. `scripts/ckptcheck.py` on the snapshot.
@@ -377,12 +377,17 @@ BMP pictures.
 
 ## What the patches and the engine are
 
-- `patches/0001-vision-image-tokens.patch`: `--vision-image-tokens` up to 262,144 (it stopped at 16,384).
+- `patches/0001-contract-controls-include.patch`: upstream's `91eab7d0`, "cuda contract: the softcap control includes
+  the act_round helpers it calls". Backported for v1.1.4; drop it when `TF_REF` includes `91eab7d0`.
 - `patches/0002-register-bolt.patch`: the family `nemotron_h_puzzle` (an omni config around a puzzle text model reads as
   that type in the server and the `models` CLI), its registration in the CUDA host beside upstream's own Bolt family,
-  `--parallel` handed to a family that sizes its state by it, `zig build bolt` for libbolt, and `zig build
+  `zig build bolt` for libbolt, and `zig build
   compile-bolt-family`, which compiles the backend without a GPU. Video input (TensorFold #940) and the omni vocabulary
-  size for structured output (#951), patches of this recipe before, are upstream's in 1.1.0.
+  size for structured output (#951), patches of this recipe before, are upstream's since 1.1.0. In v1.1.4, upstream
+  also supplies the image-token cap of 262144 and passes `--parallel` to families that size their state by it.
+- `patches/0003-w4a8-test-verdict.patch`: upstream's `f70f50bad`, "test(cuda): pass the current W4A8 exceptional-input
+  verdict". It updates the CUDA test's prompt calls and checks the finite-input verdict without dropping its comparisons.
+  Drop it when `TF_REF` includes `f70f50bad`.
 - `engine/bolt_native.zig` and `engine/bolt_api.zig` (its libbolt binding; both copied into the family at build time) are
   the lane backend; `engine/*.cu` builds
   `libbolt.so` (`zig build bolt -Dbolt-src=engine`, linked with `-lcuda` for the virtual-memory calls). [`docs/engine.md`](docs/engine.md) has the
@@ -406,7 +411,7 @@ python3 scripts/ckptcheck.py /path/to/snapshot
 start.sh      prepare, check, launch
 stop.sh       stop a launch
 scripts/      prepare.sh, config.sh, publish-image.sh, banner.sh, ckptcheck.py (+ its test)
-patches/      the Bolt registration and the image-token cap, applied onto TensorFold at TF_REF
+patches/      upstream CUDA build fixes and Bolt registration, applied onto TensorFold at TF_REF
 engine/       bolt_native.zig and bolt_api.zig (lane backend and its libbolt binding), the CUDA sources of libbolt.so
 contract/     bolt.json, the pinned checkpoint's schedule and quant groups
 docs/         engine.md, the backend and the engine; speed-research.md, the stage profiles and the plan
