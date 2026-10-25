@@ -24,7 +24,35 @@ greedy prose, 385 code, 251 and 280 sampled.
   The libbolt build target, backend compile check, family export, hub entry and puzzle-model routing are retained.
 - The Dockerfile reads xgrammar's pin from `zig/src/platform/grammar_library.zig`; upstream now installs libtfgrammar
   directly into `native/lib`, so the copy from the old `lib` location is gone.
-- The measured results below remain from their recorded runs; this rebase adds no GPU measurements.
+- Measured against 1.1.0 (2026-10-25, one DGX Spark GB10, `THINKING=0`, port 8899): four fresh boots in the order
+  A1 (1.1.0, `zig-76aafcf`), B1 (1.1.4, `zig-eab8582`), B2 (1.1.4), A2 (1.1.0), each `PREPARE=0 ./start.sh restart`
+  with its own smoke test, then nine exact requests, cold prefill, and TensorFold 1.1.0's `bench_concurrent.py
+  --levels 1,8 --reps 3 --tokens 256 --temperatures 0,1.0`. All four boots and benches exited 0, and
+  `scripts/test_ckptcheck.py` passed on both trees. The nine exact replies (prose, code, math, schema, two forced tool
+  calls, vision, thinking on, sampled at seed 7) are byte-identical across the four boots, and every decode run's
+  token_sha256 matches. Decode is within noise: -1.7 % to +3.0 % aggregate. The two boots of one build differ by up to
+  0.8 % (1.1.0) and 4.5 % (1.1.4, chat sampled at 8 streams).
+
+  | prompt | temp | streams | A1 | B1 | B2 | A2 | 1.1.4 vs 1.1.0 |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | code | 0.0 | 1 | 138.9 | 138.4 | 139.7 | 139.3 | -0.0 % |
+  | code | 0.0 | 8 | 354.0 | 356.8 | 357.5 | 356.9 | +0.5 % |
+  | chat | 0.0 | 1 | 75.6 | 74.1 | 74.2 | 75.2 | -1.7 % |
+  | chat | 0.0 | 8 | 255.2 | 254.7 | 258.9 | 256.0 | +0.5 % |
+  | code | 1.0 | 1 | 135.5 | 134.5 | 135.9 | 135.5 | -0.2 % |
+  | code | 1.0 | 8 | 236.6 | 245.9 | 243.3 | 238.3 | +3.0 % |
+  | chat | 1.0 | 1 | 71.3 | 70.3 | 71.0 | 71.7 | -1.2 % |
+  | chat | 1.0 | 8 | 211.7 | 204.6 | 213.8 | 210.8 | -1.0 % |
+
+  Aggregate tok/s, median of 3 runs per boot. The last column compares the mean of B1 and B2 with the mean of A1 and A2.
+
+  Cold prefill, `max_tokens 1`, client wall time: 3,845 tokens at 2,539 / 2,539 / 2,548 / 2,530 tok/s (A1 / B1 / B2 / A2,
+  +0.4 %), and 3,900 tokens at 2,612 / 2,580 / 2,595 / 2,604 (-0.8 %). The 16,079- and 16,125-token prompts ran only on
+  A1 (2,644 and 2,639 tok/s). On B1, B2 and A2 they returned HTTP 500: `bolt: no memory to grow sequence 0 past 4096
+  tokens`. Those three boots reported 2.2, 3.6 and 6.5 GiB free after load, against 26.6 GiB for A1. A2 is the same
+  1.1.0 image as A1 and fails the same way, so I attribute this to the machine's memory state at boot, not to 1.1.4.
+  Other jobs ran on that machine during the comparison. 1.1.4 prefill beyond 4k tokens is therefore not measured here.
+  The earlier results below remain from their recorded runs.
 
 ### Prompt attention 2.2 to 2.5× at long context, and the fp4 kernel at 154 TFLOPS
 
