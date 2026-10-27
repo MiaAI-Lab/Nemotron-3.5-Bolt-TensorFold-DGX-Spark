@@ -133,8 +133,9 @@ RUN cd /tensorfold && tools/zig/build_ffmpeg.sh /opt/ffmpeg >/tmp/ffmpeg.log 2>&
     tar -xzf /tmp/jt.tgz -C /tmp && cd /tmp/libjpeg-turbo-3.1.4.1 && \
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_STATIC=0 -DWITH_TURBOJPEG=1 -DCMAKE_INSTALL_PREFIX=/opt/jpeg >/dev/null && \
     cmake --build build -j"$(nproc)" >/dev/null && cmake --install build >/dev/null && rm -rf /tmp/jt.tgz /tmp/libjpeg-turbo-3.1.4.1
-# structured output (response_format, forced tool_choice) loads libtfgrammar, built from the xgrammar release the pinned tree names
-RUN tag="$(sed -n 's/^pub const pinned = "\(.*\)";/\1/p' /tensorfold/zig/build/grammar.zig)" && test -n "$tag" && \
+# structured output (response_format, forced tool_choice) loads libtfgrammar, built from the xgrammar release the pinned tree
+# names (zig/src/platform/grammar_library.zig since TensorFold 1.1.3; zig/build/grammar.zig imports it from there)
+RUN tag="$(sed -n 's/^pub const pinned = "\(.*\)";/\1/p' /tensorfold/zig/src/platform/grammar_library.zig)" && test -n "$tag" && \
     git clone -q --branch "$tag" --recurse-submodules https://github.com/mlc-ai/xgrammar /opt/xgrammar && \
     test "$(git -C /opt/xgrammar describe --tags --exact-match)" = "$tag"
 COPY patches /opt/tf-patches
@@ -144,7 +145,7 @@ RUN cd /tensorfold && \
     cp /opt/bolt-engine/bolt_native.zig /opt/bolt-engine/bolt_api.zig zig/src/families/nemotron/
 RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dbolt-src=/opt/bolt-engine -Dffmpeg=/opt/ffmpeg \
       -Dxgrammar=/opt/xgrammar -Doptimize=fast --prefix /opt/tensorfold -j"$(nproc)" install native bolt video grammar && \
-    cp -a /opt/jpeg/lib/libturbojpeg.so.0* /opt/tensorfold/lib/libtfgrammar.so /opt/tensorfold/native/lib/ && \
+    cp -a /opt/jpeg/lib/libturbojpeg.so.0* /opt/tensorfold/native/lib/ && \
     test -x /opt/tensorfold/native/bin/tensorfold-native && \
     test -f /opt/tensorfold/native/lib/libbolt.so && test -f /opt/tensorfold/native/lib/libtfvideo.so && \
     test -f /opt/tensorfold/native/lib/libturbojpeg.so.0 && test -f /opt/tensorfold/native/lib/libtfgrammar.so

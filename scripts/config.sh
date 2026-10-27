@@ -24,10 +24,11 @@ QUANT_LABEL="IQ2_XXS+NVFP4+Q8_0"
 DRAFT_ID="${DRAFT_ID:-nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr}"
 DRAFT_REVISION="${DRAFT_REVISION:-4c6a5613b6d887194a3a5493e3a18a5b3930bb86}"
 
-# TensorFold v1.1.0 (its RADIO tower, image and video input, structured output for omni checkpoints). patches/ register
-# the libbolt Bolt family and lift the image-token cap. Zig ZIG_VERSION builds the native CUDA server.
+# TensorFold v1.1.6 (2026-10-26: shared-prefix prompts wait for each other, cancelled prompts keep their prefill, the
+# keyed-race sampler, the lane host's prompt and burst scheduling). patches/0002 registers the libbolt Bolt family; the
+# image-token cap it used to lift is upstream's since 1.1.3. Zig ZIG_VERSION builds the native CUDA server.
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
-TF_REF="${TF_REF:-76aafcf274e60a5e31a59ce145b2f71f7b366e9d}"
+TF_REF="${TF_REF:-eea9dc9c9c8b459c0a03de7f6fe0c6f4835d69ab}"
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"

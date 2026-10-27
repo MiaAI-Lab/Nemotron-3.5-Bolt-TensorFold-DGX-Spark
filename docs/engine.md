@@ -1,7 +1,7 @@
 # The Bolt backend and engine
 
-`./start.sh` builds TensorFold at `76aafcf2` (v1.1.0), applies `patches/`, copies `engine/bolt_native.zig` and `engine/bolt_api.zig` into
-`zig/src/families/nemotron/` and compiles `engine/*.cu` into `/opt/tensorfold/lib/libbolt.so`. `tensorfold-native`
+`./start.sh` builds TensorFold at `eea9dc9c` (v1.1.6), applies `patches/`, copies `engine/bolt_native.zig` and `engine/bolt_api.zig` into
+`zig/src/families/nemotron/` and compiles `engine/*.cu` into `/opt/tensorfold/native/lib/libbolt.so`. `tensorfold-native`
 opens the checkpoint through the `nemotron_h_puzzle` family that `patches/0002` registers, loads libbolt from its own `lib/` and serves.
 
 ## Why a separate library
@@ -30,7 +30,7 @@ head of the queue.
 | `first` / `queue` / `first_masked` | the keyed draw of one row at the given position; `first_masked` draws the first token again among the tokens a grammar's mask allows |
 | `verify` | **one forward over every stream's window** (up to 16 windows, 128 rows): `pending`, the held drafts and any host drafts, each row drawn with its stream's `Sampling` at its own position (among the allowed tokens when the window carries a grammar's masks) |
 | `keep` | roll each stream back to its accepted prefix (`bolt_keep_seq`; a repeat is a no-op) |
-| `draft` | cuts each stream back to its kept rows first (a shared round drafts before it keeps), then LiLiCorr proposes seven tokens for every stream in **one pass over the drafter's weights**; the first `depth` are held for the next window |
+| `draft` | cuts each stream back to its kept rows first (a shared round drafts before it keeps), then LiLiCorr proposes seven tokens for every stream in **one pass over the drafter's weights** (one CUDA graph a stream count, `BOLT_DRAFT_GRAPH=0` launches eagerly); the first `depth` are held for the next window |
 | `release` | gives the sequence back and unmaps the attention memory it grew into |
 
 Draws use `lanes.sampling.choose` (Gumbel over the top candidates, `top_k` / `top_p` / `min_p`, keyed by seed and

@@ -2,8 +2,8 @@
 
 - [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart ([ashhart](https://github.com/ashhart)) and the
   [TensorFold contributors](https://github.com/ashhart/TensorFold/graphs/contributors). This recipe pins
-  `76aafcf274e60a5e31a59ce145b2f71f7b366e9d` (v1.1.0): its Zig server, RADIO image tower, video decoder (`libtfvideo`)
-  and [Nemotron recipes](https://github.com/ashhart/TensorFold/blob/76aafcf274e60a5e31a59ce145b2f71f7b366e9d/docs/recipes/nemotron-3.5-super-vl.md).
+  `eea9dc9c9c8b459c0a03de7f6fe0c6f4835d69ab` (v1.1.6): its Zig server, RADIO image tower, video decoder (`libtfvideo`)
+  and [Nemotron recipes](https://github.com/ashhart/TensorFold/blob/eea9dc9c9c8b459c0a03de7f6fe0c6f4835d69ab/docs/recipes/nemotron-3.5-super-vl.md).
 - [NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB) by
   NVIDIA, revision `a326822af111290f2af5ac59ef4b5040347dabc4`. The weights are under the OpenMDW License Agreement,
   version 1.1, and are downloaded at setup. They are not part of this repository.

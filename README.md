@@ -43,35 +43,46 @@ template, thinking budget, round loop, stop handling and keyed sampler are Tenso
 
 ## Speed
 
-Decode measured on 2026-10-20 with TensorFold's [`tools/bench_concurrent.py`](https://github.com/ashhart/TensorFold/blob/76aafcf274e60a5e31a59ce145b2f71f7b366e9d/tools/bench_concurrent.py)
+Decode measured on 2026-10-27 with TensorFold's [`tools/bench_concurrent.py`](https://github.com/ashhart/TensorFold/blob/eea9dc9c9c8b459c0a03de7f6fe0c6f4835d69ab/tools/bench_concurrent.py)
 against the running server (this build's defaults, thinking off): N clients send the same
 prompt at once, 256 tokens each, medians of three runs. "aggregate" is the server's tokens a second over all N, "each
-stream" one client's decode rate, TTFT the slowest client's time to its first token. The prefill table is from an
-earlier run with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) (the prompt path has not changed since). The
-1.0.12 build measured the same way on the same day is in [`CHANGELOG.md`](CHANGELOG.md), cell for cell.
+stream" one client's decode rate, TTFT the slowest client's time to its first token. The
+1.1.0 build measured the same way on the same day is in [`CHANGELOG.md`](CHANGELOG.md), cell for cell.
 
 Decode, greedy (`temperature 0`):
 
 | clients | prose aggregate | prose each | code aggregate | code each | TTFT |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| ×1 | 73.7 tok/s | 73.7 tok/s | 137.3 tok/s | 137.3 tok/s | 50–70 ms |
-| ×8 | 240.3 tok/s | 32.7 tok/s | 342.0 tok/s | 48.5 tok/s | 0.9–1.0 s |
-| ×16 | 284.4 tok/s | 20.4 tok/s | 385.1 tok/s | 29.2 tok/s | 2.3–2.6 s |
+| ×1 | 73.8 tok/s | 73.8 tok/s | 137.4 tok/s | 137.4 tok/s | 50–60 ms |
+| ×8 | 318.3 tok/s | 40.4 tok/s | 463.2 tok/s | 60.1 tok/s | 0.4–1.3 s |
+| ×16 | 329.7 tok/s | 21.4 tok/s | 506.8 tok/s | 33.1 tok/s | 0.7–0.9 s |
 
 Decode, sampled (`temperature 1.0`, `top_p 0.95`, seeded):
 
 | clients | prose aggregate | prose each | code aggregate | code each | TTFT |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| ×1 | 70.6 tok/s | 70.6 tok/s | 133.4 tok/s | 133.4 tok/s | 50–70 ms |
-| ×8 | 205.4 tok/s | 28.1 tok/s | 230.7 tok/s | 39.0 tok/s | 0.9–1.0 s |
-| ×16 | 251.1 tok/s | 18.4 tok/s | 280.0 tok/s | 23.9 tok/s | 2.3–2.6 s |
+| ×1 | 71.8 tok/s | 71.8 tok/s | 136.1 tok/s | 136.1 tok/s | 50–60 ms |
+| ×8 | 211.5 tok/s | 27.9 tok/s | 252.2 tok/s | 40.1 tok/s | 0.4 s |
+| ×16 | 260.6 tok/s | 17.8 tok/s | 293.2 tok/s | 23.2 tok/s | 0.7–0.8 s |
 
-Every cell's replies were token for token the same as the 1.0.12 build's, with `SSM_LAZY=0` and with `DRAFT_Q8=0`
-(the tool's `token_sha256` over all three runs).
+Every cell's replies were token for token the same as the 1.1.0 build's, all 300 of them (the tool's `token_sha256`
+over all three runs), and each concurrent reply the same as the request run alone. The clients of a cell share one
+prompt, and since 1.1.6 the server prefills a new shared prefix once and lets the other requests resume from it
+(TensorFold #1321), which is where the time to first token at ×16 went from 2.3 s to 0.8 s; it is also why the
+identical greedy streams gain the most. With sixteen distinct prompts (the tool's `--prompts tools/bench_prompts.json`,
+a mix of code, chat and arithmetic), this build does 301.4 tok/s aggregate greedy at ×16 (25.4 a stream, first token
+within 0.74 s), 235.1 at ×8 (41.2 a stream); sampled 264.4 (20.9) and 209.8 (34.0). The 1.1.0 build the same day:
+294.4 (27.1, first token within 2.37 s), 228.2 (42.5), 259.1 (21.9) and 205.0 (34.5), the same 144 replies. Distinct
+prompts gain 2 to 3 % aggregate and start three times sooner; a stream's own rate is a little lower because the
+streams now join the shared rounds together instead of trickling in.
 
-Prefill (2026-10-20) with a fresh random-word prompt and `max_tokens 1` (so the prompt cache cannot help), in
-tokens a second of prompt: 2,310 to 2,410 at 2.7k tokens, 2,490 to 2,510 at 5.3k, 2,485 at 21k, 2,365 at 42k,
-2,255 at 63k, 1,975 at 126k (the 1.0.12 build: 1,640, 1,690, 1,650, 1,520, and 987 at 128k). These are with
+Prefill (2026-10-27) with a fresh random-word prompt and `max_tokens 1` (so the prompt cache cannot help), in
+tokens a second of prompt: 2,375 to 2,470 at 2.6k tokens, 2,520 at 5.3k, 2,485 at 21k, 2,360 at 42k,
+2,250 at 63k, 1,970 at 126k. The 1.1.0 build on 2026-10-20 measured 2,310 to 2,410, 2,490 to 2,510, 2,485, 2,365,
+2,255 and 1,975: the prompt pass is the same code and the same speed (the 1.0.12 build: 1,640, 1,690, 1,650, 1,520,
+and 987 at 128k). What 1.1.6 adds to prompts is that a cancelled one is not lost: a 106k-token prompt whose client
+closed the connection 20 s into its 52 s prefill left 47,104 tokens in the prompt cache, and the same prompt sent
+again had its first token after 31.9 s instead of 52 (the 1.1.0 build started over: 51.9 s). These are with
 `NV4_FP4=1`, the prompt pass's two NVFP4 projections on the fp4 tensor cores with NVFP4 rows, which costs 0.8 %
 perplexity on the harness in `engine/tools`; `NV4_FP4=0` keeps fp16 rows and the exact numbers at about 7 % less.
 The long-context end comes from a prompt attention kernel that is 2.2 to 2.5× the old one with identical outputs.
@@ -81,12 +92,12 @@ Prefill, cold prompts of one request (this build, `max_tokens 1`):
 
 | prompt | prefill | TTFT | tokens |
 | ---: | ---: | ---: | ---: |
-| 2.7k | 2,312 to 2,408 tok/s | 1.1 s | 2,656 to 2,663 |
-| 5.3k | 2,493 to 2,508 tok/s | 2.1 s | 5,270 to 5,346 |
-| 21k | 2,483 tok/s | 8.5 s | 21,014 to 21,046 |
-| 42k | 2,365 tok/s | 17.8 s | 41,905 to 42,400 |
-| 63k | 2,254 tok/s | 28.1 s | 63,214 |
-| 126k | 1,973 tok/s | 64.1 s | 126,455 |
+| 2.6k | 2,375 to 2,468 tok/s | 1.1 s | 2,603 to 2,623 |
+| 5.3k | 2,518 to 2,525 tok/s | 2.1 s | 5,328 to 5,398 |
+| 21k | 2,485 to 2,486 tok/s | 8.4 s | 20,877 to 20,961 |
+| 42k | 2,361 to 2,363 tok/s | 17.8 s | 41,998 to 42,159 |
+| 63k | 2,248 to 2,250 tok/s | 28.1 s | 63,052 to 63,204 |
+| 126k | 1,969 tok/s | 64.1 s | 126,114 to 126,176 |
 
 ## How it is built
 
@@ -208,7 +219,7 @@ cd Nemotron-3.5-Bolt-TensorFold-DGX-Spark
 ./start.sh
 ```
 
-The first run builds TensorFold at `76aafcf2` (v1.1.0) with `patches/` and the engine in `engine/`, downloads the checkpoint
+The first run builds TensorFold at `eea9dc9c` (v1.1.6) with `patches/` and the engine in `engine/`, downloads the checkpoint
 (23 GiB) and the LiLiCorr drafter (1.3 GB), checks them, starts the server and sends a smoke request. Later runs
 reuse the image and the snapshots. Loading takes about 45 seconds with the files in the page cache.
 
@@ -242,7 +253,7 @@ defaults (`./start.sh restart --context 131072`). `DRY_RUN=1` prints the docker 
 **`scripts/prepare.sh`:**
 
 1. Preflight: Docker, disk, `MemAvailable`.
-2. The image `tensorfold-nemotron-bolt:zig-76aafcf`: TensorFold at `TF_REF` with every `patches/*.patch` applied,
+2. The image `tensorfold-nemotron-bolt:zig-eea9dc9`: TensorFold at `TF_REF` with every `patches/*.patch` applied,
    `zig test zig/src/families/nemotron/config.zig`, Zig 0.17.0, on `nvcr.io/nvidia/pytorch:26.07-py3`, then
    `zig build -Dnvcc=… install native`. It tries a prebuilt image from GitHub Container Registry first
    (`PULL=0` builds locally). No image is published for this revision, so the first run builds.
@@ -298,7 +309,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `KV_PIN` | `0` | `1` maps every stream's whole `CONTEXT` window at load and keeps it: `PARALLEL` × `CONTEXT` × 8 KB (bf16) or 4.1 KB (fp8), e.g. 8 × 262,144 = 16 GiB. The memory is then certain, and a start that cannot have it fails at once, naming `PARALLEL`, `CONTEXT` and `KV_DTYPE` |
 | `KV_DTYPE` | `bf16` | `fp8` stores K and V as e4m3 with an fp32 scale per token and head: 4.1 KB a token instead of 8 KB, so twice the tokens in the same memory and half the prompt-cache bytes. Passed to libbolt as `BOLT_KV` (the native server itself refuses `--kv-dtype`). No speed cost; see below |
 | `SSM_LAZY` | `1` | one copy of each stream's Mamba state instead of two: a verify window writes none, and the stream's next forward folds the kept rows in from the saved scan inputs, so a partial accept costs no replay pass and a stream holds 0.28 GiB from load instead of 0.41. Measured: the same replies token for token, 3 to 8 % more tokens a second at 4 to 16 streams, no change alone. `0` is the two-copy path (`BOLT_SSM_LAZY`) |
-| `BOLT_*` | | any `BOLT_*` variable in the environment is passed into the container: libbolt's own switches, e.g. `BOLT_PACK=0` (fp32 GEMM rows), `BOLT_MOE_COOP=0`, `BOLT_ATTN_V2=0` (the first prompt attention kernel), `BOLT_PDL=0`, `BOLT_CAL=spread`, `BOLT_PROF=1`, `BOLT_STATS=1`; and the off-by-default experiments `BOLT_IQ2_WHOLE=1`, `BOLT_SHARED_DECODE=1`, `BOLT_DENSE_RING=1`, `BOLT_TILE=1` (see the changelog) |
+| `BOLT_*` | | any `BOLT_*` variable in the environment is passed into the container: libbolt's own switches, e.g. `BOLT_PACK=0` (fp32 GEMM rows), `BOLT_MOE_COOP=0`, `BOLT_ATTN_V2=0` (the first prompt attention kernel), `BOLT_PDL=0`, `BOLT_DRAFT_GRAPH=0` (the drafter's proposal launched eagerly instead of as one CUDA graph), `BOLT_CAL=spread`, `BOLT_PROF=1`, `BOLT_STATS=1`; and the off-by-default experiments `BOLT_IQ2_WHOLE=1`, `BOLT_SHARED_DECODE=1`, `BOLT_DENSE_RING=1`, `BOLT_TILE=1` (see the changelog) |
 | `NV4_FP4` | `1` | the prompt pass's `in_proj` and `out_proj` on the fp4 tensor cores with the rows quantized to NVFP4 (vLLM's NVFP4 path does the same): prefill +17 to 20 %, perplexity +0.8 % on the harness. `0` keeps fp16 rows (`BOLT_NV4_FP4`) |
 | `DRAFT_Q8` | `1` | the LiLiCorr drafter's attention and kernel projections as Q8_0 instead of bf16, half the bytes a proposal reads. Every draft is checked by the target, so this changes what is proposed, never the reply; `0` keeps bf16 (`BOLT_DRAFT_Q8`). Measured: the same replies and the same speed within noise either way (a proposal takes 6.4 ms against 7.2); Q8_0 keeps 200 MB |
 | `VISION` | `1` | loads TensorFold's RADIO tower and projector (1.7 GB) so requests can carry images and video: `--vision` and the four limits below. `0` serves text only and skips the weights |
@@ -377,12 +388,12 @@ BMP pictures.
 
 ## What the patches and the engine are
 
-- `patches/0001-vision-image-tokens.patch`: `--vision-image-tokens` up to 262,144 (it stopped at 16,384).
-- `patches/0002-register-bolt.patch`: the family `nemotron_h_puzzle` (an omni config around a puzzle text model reads as
-  that type in the server and the `models` CLI), its registration in the CUDA host beside upstream's own Bolt family,
-  `--parallel` handed to a family that sizes its state by it, `zig build bolt` for libbolt, and `zig build
-  compile-bolt-family`, which compiles the backend without a GPU. Video input (TensorFold #940) and the omni vocabulary
-  size for structured output (#951), patches of this recipe before, are upstream's in 1.1.0.
+- `patches/0002-register-bolt.patch` (the one patch left): the family `nemotron_h_puzzle` (an omni config around a
+  puzzle text model reads as that type in the server and the `models` CLI), its registration in the CUDA host beside
+  upstream's own Bolt family, `zig build bolt` for libbolt, and `zig build compile-bolt-family`, which compiles the
+  backend without a GPU. What earlier patches carried is upstream's now: video input (TensorFold #940) and the omni
+  vocabulary size for structured output (#951) since 1.1.0, `--vision-image-tokens` up to 262,144 (#1198) since 1.1.3,
+  `--parallel` handed to a family that sizes its state by it since 1.1.1.
 - `engine/bolt_native.zig` and `engine/bolt_api.zig` (its libbolt binding; both copied into the family at build time) are
   the lane backend; `engine/*.cu` builds
   `libbolt.so` (`zig build bolt -Dbolt-src=engine`, linked with `-lcuda` for the virtual-memory calls). [`docs/engine.md`](docs/engine.md) has the
@@ -406,7 +417,7 @@ python3 scripts/ckptcheck.py /path/to/snapshot
 start.sh      prepare, check, launch
 stop.sh       stop a launch
 scripts/      prepare.sh, config.sh, publish-image.sh, banner.sh, ckptcheck.py (+ its test)
-patches/      the Bolt registration and the image-token cap, applied onto TensorFold at TF_REF
+patches/      the Bolt registration, applied onto TensorFold at TF_REF
 engine/       bolt_native.zig and bolt_api.zig (lane backend and its libbolt binding), the CUDA sources of libbolt.so
 contract/     bolt.json, the pinned checkpoint's schedule and quant groups
 docs/         engine.md, the backend and the engine; speed-research.md, the stage profiles and the plan

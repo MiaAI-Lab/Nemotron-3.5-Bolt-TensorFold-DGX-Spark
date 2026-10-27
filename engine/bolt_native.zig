@@ -204,6 +204,15 @@ const Engine = struct {
         while (!try prefillStep(ptr, s)) {}
     }
 
+    /// A cancelled prompt pass keeps the prefix it had done: the cache's hook saves the sequence's state at that row
+    /// (as prefillStep does at a mark), so a retry of the same prompt resumes there. No prompt work runs here.
+    fn cancelPrefill(ptr: *anyopaque, s: *lanes.Stream) !void {
+        const e: *Engine = @ptrCast(@alignCast(ptr));
+        const slot = e.slots.get(s) orelse return;
+        if (slot.decoding or slot.at == 0) return;
+        s.keepInterruptedPrefill(@intCast(slot.at));
+    }
+
     fn first(ptr: *anyopaque, s: *lanes.Stream, position: u64) !u64 {
         const e: *Engine = @ptrCast(@alignCast(ptr));
         const token = try e.draw(s, 0, position, candCount(s));
@@ -399,6 +408,7 @@ const Engine = struct {
             var v: lanes.backend.Backend.VTable = .{
                 .prefill = Engine.prefill,
                 .prefill_step = Engine.prefillStep,
+                .cancel_prefill = Engine.cancelPrefill,
                 .first = Engine.first,
                 .first_masked = Engine.firstMasked,
                 .held = Engine.held,

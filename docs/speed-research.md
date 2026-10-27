@@ -76,8 +76,13 @@ many-row MoE path, not the single stream.
    spin waits on the host (`BOLT_SPIN`, measured below). Fusing the small kernels around each GEMM (norm into the
    GEMM prologue, `quant_rows` into the producer's epilogue, combine into `fc2`) removes about ten launches a
    layer; with PDL in place the gain is a few percent more.
-3. **Proposal in a CUDA graph** (6.4 → ~5 ms a round, 3 %): the drafter's eager launches and sync become one graph
-   launch a round.
+3. **Proposal in a CUDA graph** (hoped 6.4 → ~5 ms a round, 3 %): the drafter's eager launches and sync become one
+   graph launch a round. Done 2026-10-26 (`BOLT_DRAFT_GRAPH`, default on; see the changelog) and measured 2026-10-27:
+   6.5 → 6.4 to 6.5 ms a proposal, 19.9 → 19.7 to 19.8 at sixteen streams, about 1 % more tokens a second alone and
+   nothing at eight streams. The launches were not the cost; the proposal is bound by its
+   kernels (LiLiCorr's five layers and the head over seven slots at one row each, memory-bound), so the next step for
+   the drafter is fewer or fused kernels, or a smaller read (Q8_0 already halved it). Kept on: it costs nothing and
+   removes about 130 launches a round from the host thread.
 4. **`lm_head` in NVFP4** (0.54 → 0.27 GB a window, about 1 ms a round, 2 %): quality has to be checked; the
    output layer is the one place NVIDIA's own NVFP4 exports usually keep in higher precision.
 5. **Acceptance**: measure accepted tokens a round on NVIDIA's categories to confirm the port matches their 4.7;

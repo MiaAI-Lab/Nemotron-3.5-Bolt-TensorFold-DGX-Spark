@@ -259,6 +259,11 @@ struct Draft {
     int *cids = nullptr, *csi = nullptr;
     int* out_dev = nullptr;
     int* out_host = nullptr;   // [nb][SLOTS]
+    // the call's anchor rows, gathered on the device from a pinned pointer table (a graph holds no changing addresses)
+    const float** ancp = nullptr; const float** ancp_h = nullptr;   // [nb]
+    // BOLT_DRAFT_GRAPH (default on): the proposal's launches for B streams, captured once and replayed as one graph
+    std::unordered_map<int, cudaGraphExec_t> graphs;
+    bool graph_off = false;   // a capture failed: propose eagerly from then on
 };
 
 namespace {
@@ -907,6 +912,7 @@ Draft* draft_open(const char* dir, const uint16_t* embed, const TQ8& head, int n
     CK(cudaMallocHost(&d->ckp_h, DL * NB * sizeof(void*)));
     CK(cudaMallocHost(&d->cvp_h, DL * NB * sizeof(void*)));
     CK(cudaMallocHost(&d->clen_h, NB * 4)); CK(cudaMallocHost(&d->pos_h, NB * 4)); CK(cudaMallocHost(&d->anc_h_tok, NB * 4));
+    CK(cudaMalloc(&d->ancp, NB * sizeof(void*))); CK(cudaMallocHost(&d->ancp_h, NB * sizeof(void*)));
     {
         std::vector<const float*> rk(DL * NB), rv(DL * NB);
         for (int l = 0; l < DL; l++) for (size_t q = 0; q < NB; q++) { rk[l * NB + q] = d->sq[q].ck[l]; rv[l * NB + q] = d->sq[q].cv[l]; }
@@ -1004,32 +1010,29 @@ void draft_ingest_multi(Draft* d, int nrows, const float* cap, int nseq, const i
     for (int i = 0; i < nseq; i++) d->sq[seqs[i]].clen = pos0[i] + n[i];
 }
 
-// Seven draft tokens each for the blocks that start with anchors[i] at positions pos[i] of sequences seqs[i]: the
-// streams share every weight read. got[i] is how many tokens stream i drafted (0: its context is not at pos[i]).
-void draft_propose_multi(Draft* d, int n, const int* seqs, const int* anchors, const int* pos, int* out, int* got, cudaStream_t s) {
-    for (int i = 0; i < n; i++) got[i] = 0;
-    if (!d || n < 1) return;
-    // streams the drafter can serve now; the rest report 0
-    int idx[SEG_MAX], B = 0;
-    for (int i = 0; i < n && B < d->nb; i++) {
-        Draft::SeqCtx& q = d->sq[seqs[i]];
-        if (q.clen <= 0 || pos[i] != q.clen) continue;
-        idx[B++] = i;
-    }
-    if (B == 0) return;
-    S = s;
-    for (int b = 0; b < B; b++) {
-        Draft::SeqCtx& q = d->sq[seqs[idx[b]]];
-        for (int l = 0; l < DL; l++) { d->ckp_h[l * d->nb + b] = q.ck[l]; d->cvp_h[l * d->nb + b] = q.cv[l]; }
-        d->clen_h[b] = q.clen;
-        d->pos_h[b] = pos[idx[b]];
-        d->anc_h_tok[b] = anchors[idx[b]];
-    }
+// out[b] = *ptrs[b], n floats a row: the anchors of the call's streams, whose addresses a graph cannot hold.
+__global__ void gather_rows_k(const float* const* __restrict__ ptrs, float* __restrict__ out, int n) {
+    const float* src = ptrs[blockIdx.x];
+    float* dst = out + (size_t)blockIdx.x * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+}
+
+// dattn2_k's shared memory, allowed once (outside any capture)
+void dattn_opt() {
+    static bool opted = false;
+    if (!opted) { cudaFuncSetAttribute(dattn2_k, cudaFuncAttributeMaxDynamicSharedMemorySize, DA_SMEM); opted = true; }
+}
+
+// The proposal for B blocks, every launch on S: what one call varies (which streams, their rings, lengths, positions,
+// anchors) comes from the pinned tables, copied in here, so the same sequence of launches serves any later call with B
+// streams and can be captured as a graph. Ends with the slots copied to out_host; the caller waits for the stream.
+void propose_body(Draft* d, int B, cudaStream_t s) {
     CK(cudaMemcpyAsync(d->ckp, d->ckp_h, DL * d->nb * sizeof(void*), cudaMemcpyHostToDevice, s));
     CK(cudaMemcpyAsync(d->cvp, d->cvp_h, DL * d->nb * sizeof(void*), cudaMemcpyHostToDevice, s));
     CK(cudaMemcpyAsync(d->clen_d, d->clen_h, d->nb * 4, cudaMemcpyHostToDevice, s));
     CK(cudaMemcpyAsync(d->pos_d, d->pos_h, d->nb * 4, cudaMemcpyHostToDevice, s));
     CK(cudaMemcpyAsync(d->anc_d, d->anc_h_tok, d->nb * 4, cudaMemcpyHostToDevice, s));
+    CK(cudaMemcpyAsync(d->ancp, d->ancp_h, (size_t)B * sizeof(void*), cudaMemcpyHostToDevice, s));
     const int R = B * BLOCK;            // rows of all the blocks
     const int NN = B * NODES;           // lattice nodes of all the streams
     dmark("start");
@@ -1050,8 +1053,6 @@ void draft_propose_multi(Draft* d, int n, const int* seqs, const int* anchors, c
         qk_norm_rope_k<<<dim3(R, HEADS), 64, 0, s>>>(d->q, a.qn, HEADS, 0, d->pos_d);
         qk_norm_rope_k<<<dim3(R, KVH), 64, 0, s>>>(d->k, a.kn, KVH, 0, d->pos_d);
         if (dattn_tiled()) {
-            static bool opted = false;
-            if (!opted) { cudaFuncSetAttribute(dattn2_k, cudaFuncAttributeMaxDynamicSharedMemorySize, DA_SMEM); opted = true; }
             dattn2_k<<<dim3(4, KVH, B), 256, DA_SMEM, s>>>(d->q, d->k, d->v, d->ckp + (size_t)l * d->nb, d->cvp + (size_t)l * d->nb, a.sink, d->h, d->clen_d, d->pos_d);
         } else {
             dattn_k<<<dim3(HEADS, R), 128, 0, s>>>(d->q, d->k, d->v, d->ckp + (size_t)l * d->nb, d->cvp + (size_t)l * d->nb, a.sink, d->h, d->clen_d, d->pos_d);
@@ -1108,7 +1109,7 @@ void draft_propose_multi(Draft* d, int n, const int* seqs, const int* anchors, c
     }
     rms(d->nodes, d->out_norm, d->ln, LH, NN);
     dmark("lattice");
-    for (int b = 0; b < B; b++) CK(cudaMemcpyAsync(d->acat + (size_t)b * H, d->sq[seqs[idx[b]]].anchor, H * 4, cudaMemcpyDeviceToDevice, s));
+    gather_rows_k<<<B, 256, 0, s>>>(d->ancp, d->acat, H);
     mm(d->ctx_p, d->acat, H, d->astate, LH, B, d->ctx_b);
     rms(d->astate, d->anc_norm, d->astate, LH, B);
     cat3_k<<<NN, 256, 0, s>>>(d->ln, d->astate, d->cat);
@@ -1125,6 +1126,66 @@ void draft_propose_multi(Draft* d, int n, const int* seqs, const int* anchors, c
     walk_k<<<B, 256, 0, s>>>(d->aout, d->edges_out, d->edges_in, d->cids, d->out_dev, top1);
     dmark("walk");
     CK(cudaMemcpyAsync(d->out_host, d->out_dev, (size_t)B * SLOTS * 4, cudaMemcpyDeviceToHost, s));
+}
+
+// BOLT_DRAFT_GRAPH=0 launches the proposal eagerly (the way before); profiling (BOLT_DPROF) does too, for its events.
+bool draft_graph_on() {
+    static const bool on = !(getenv("BOLT_DRAFT_GRAPH") && atoi(getenv("BOLT_DRAFT_GRAPH")) == 0);
+    return on && !dprof_on();
+}
+
+// Seven draft tokens each for the blocks that start with anchors[i] at positions pos[i] of sequences seqs[i]: the
+// streams share every weight read. got[i] is how many tokens stream i drafted (0: its context is not at pos[i]).
+// The launches for B streams are captured into a CUDA graph the first time B streams propose and replayed after that:
+// the pinned tables are read at replay, so a graph serves every later call with B streams; a capture that fails
+// turns the graph off and the call runs eagerly, with the same launches.
+void draft_propose_multi(Draft* d, int n, const int* seqs, const int* anchors, const int* pos, int* out, int* got, cudaStream_t s) {
+    for (int i = 0; i < n; i++) got[i] = 0;
+    if (!d || n < 1) return;
+    // streams the drafter can serve now; the rest report 0
+    int idx[SEG_MAX], B = 0;
+    for (int i = 0; i < n && B < d->nb; i++) {
+        Draft::SeqCtx& q = d->sq[seqs[i]];
+        if (q.clen <= 0 || pos[i] != q.clen) continue;
+        idx[B++] = i;
+    }
+    if (B == 0) return;
+    S = s;
+    for (int b = 0; b < B; b++) {
+        Draft::SeqCtx& q = d->sq[seqs[idx[b]]];
+        for (int l = 0; l < DL; l++) { d->ckp_h[l * d->nb + b] = q.ck[l]; d->cvp_h[l * d->nb + b] = q.cv[l]; }
+        d->clen_h[b] = q.clen;
+        d->pos_h[b] = pos[idx[b]];
+        d->anc_h_tok[b] = anchors[idx[b]];
+        d->ancp_h[b] = q.anchor;
+    }
+    if (dattn_tiled()) dattn_opt();
+    cudaGraphExec_t exec = nullptr;
+    if (draft_graph_on() && !d->graph_off) {
+        auto it = d->graphs.find(B);
+        if (it != d->graphs.end()) {
+            exec = it->second;
+        } else {
+            cudaGraph_t g = nullptr;
+            cudaError_t e = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
+            if (e == cudaSuccess) {
+                propose_body(d, B, s);
+                e = cudaStreamEndCapture(s, &g);
+            }
+            if (e == cudaSuccess) e = cudaGraphInstantiate(&exec, g, 0);
+            if (g) cudaGraphDestroy(g);
+            if (e == cudaSuccess) {
+                d->graphs[B] = exec;
+            } else {
+                (void)cudaGetLastError();
+                exec = nullptr;
+                d->graph_off = true;
+                fprintf(stderr, "bolt draft: the proposal's graph for %d stream%s was not captured (%s): proposing eagerly\n", B, B == 1 ? "" : "s", cudaGetErrorString(e));
+            }
+        }
+    }
+    if (exec) CK(cudaGraphLaunch(exec, s));
+    else propose_body(d, B, s);
     CK(cudaStreamSynchronize(s));
     dprof_collect();
     for (int b = 0; b < B; b++) {

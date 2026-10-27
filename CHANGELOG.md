@@ -1,14 +1,109 @@
 # Changelog
 
-Newest first. This recipe targets one DGX Spark. The image is `tensorfold-nemotron-bolt:zig-76aafcf`, built by
-`scripts/prepare.sh` from TensorFold `76aafcf2` (v1.1.0) plus `patches/`.
+Newest first. This recipe targets one DGX Spark. The image is `tensorfold-nemotron-bolt:zig-eea9dc9`, built by
+`scripts/prepare.sh` from TensorFold `eea9dc9c` (v1.1.6) plus `patches/`.
 
 ## Unreleased
 
-The Bolt backend serves the checkpoint. Measured on one GB10 (this build, 2026-10-20): decode alone 74 tok/s greedy prose
-and 137 code with LiLiCorr (71 and 133 sampled; 4.3 to 36 without drafts), prefill 2,310 to 2,510 tok/s from 2.7k to
-42k tokens, 2,255 at 63k and 1,975 at 126k (NV4_FP4=0: about 7 % less); sixteen streams at once 284 tok/s aggregate
-greedy prose, 385 code, 251 and 280 sampled.
+The Bolt backend serves the checkpoint. Measured on one GB10 (this build, 2026-10-27): decode alone 74 tok/s greedy prose
+and 137 code with LiLiCorr (72 and 136 sampled; 4.3 to 36 without drafts), prefill 2,375 to 2,525 tok/s from 2.6k to
+42k tokens, 2,250 at 63k and 1,970 at 126k (NV4_FP4=0: about 7 % less); sixteen streams on one prompt 330 tok/s
+aggregate greedy prose, 507 code, 261 and 293 sampled; sixteen distinct prompts 301 greedy, 264 sampled.
+
+### TensorFold 1.1.6
+
+The 1.1.0 build (`zig-76aafcf`) measured on 2026-10-27 with the same tool, settings and day as the README's tables
+(N clients on one prompt, 256 tokens, medians of three; every reply token for token the 1.1.6 build's):
+
+| clients | greedy prose aggregate | each | greedy code aggregate | each | TTFT | sampled prose aggregate | each | sampled code aggregate | each | TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ×1 | 74.6 | 74.6 | 139.5 | 139.5 | 50–60 ms | 71.3 | 71.3 | 135.4 | 135.4 | 50 ms |
+| ×8 | 246.1 | 32.9 | 345.5 | 48.4 | 0.8–0.9 s | 205.8 | 28.7 | 230.8 | 40.6 | 0.8–0.9 s |
+| ×16 | 285.3 | 20.6 | 395.3 | 29.6 | 2.2–2.3 s | 258.3 | 18.4 | 279.0 | 24.0 | 2.1–2.4 s |
+
+Against it, 1.1.6 on the same cells: ×8 greedy prose 318.3 (+29 %), greedy code 463.2 (+34 %), sampled prose 211.5
+(+3 %), sampled code 252.2 (+9 %); ×16 greedy prose 329.7 (+16 %), greedy code 506.8 (+28 %), sampled prose 260.6
+(+1 %), sampled code 293.2 (+5 %); alone within 1 %. The time to the slowest client's first token fell from 2.2 to
+2.4 s to 0.7 to 0.9 s at ×16 and from 0.8 to 0.9 s to 0.4 s at ×8 (one greedy prose cell 1.3 s). Sixteen distinct
+prompts: 294.4 → 301.4 greedy, 259.1 → 264.4 sampled; eight: 228.2 → 235.1 and 205.0 → 209.8, first token within
+0.74 s instead of 2.4 and 0.38 instead of 0.9. The replies of every comparison hash the same (300 on one prompt, 144
+distinct).
+
+- **Rebased onto TensorFold v1.1.6** (`eea9dc9c`, 2026-10-26; 930 commits past 1.1.0). `patches/0001-vision-image-tokens`
+  is gone: upstream's `--vision-image-tokens` takes up to 262,144 since 1.1.3 (#1198). `patches/0002-register-bolt` is
+  regenerated against the new tree and is the registration alone again: the `nemotron_h_puzzle` family in the CUDA
+  host's registry (now beside Kolibri, Gemma 4, Spark-X and Dory), the server's and the `models` CLI's reading of an omni
+  config around a puzzle model as that type, `zig build bolt` and `zig build compile-bolt-family`. The `--parallel`
+  hand-off to a family whose `Options` take `lanes` is upstream's since 1.1.1, so that hunk is gone too. The Dockerfile
+  no longer copies `libtfgrammar.so` out of `lib/`: `zig build grammar` installs it beside the server since 1.1.3, and
+  it reads the xgrammar pin from `zig/src/platform/grammar_library.zig`, where 1.1.3 moved it (the first Spark build
+  found no pin at the old place and stopped before libtfgrammar).
+- **The lane core's interface grew optional fields only**, so the backend runs as before: `Backend.VTable` gained
+  `cancel_prefill`, `prefill_many`/`many_rows`, `embedding`, `score` and the proposal-head hooks, `Model` gained
+  `root_copies`, `context_copies`, `copy_match` and `lone_cost_tile`, all at their defaults here (the new copy-draft
+  modes are turned on upstream for one Qwen geometry only; they wait for a measured round on the Spark).
+- **A cancelled prompt keeps the prefill it had done** (`cancel_prefill`, the hook 1.1.5 added for #1228). When a
+  request is cancelled mid-prompt, the backend asks the prompt cache to keep the sequence's state at the last row it
+  had filled (as it does at the cache's marks), so a retry of the same prompt resumes there instead of starting over.
+  libbolt's `bolt_snap_save_seq` saves at the sequence's current row, which is exactly where a cut piece leaves it.
+  Measured 2026-10-27: a 106,527-token random-word prompt (52.0 s to prefill cold) whose client closed the connection
+  after 20 s left `prefill 106527 tokens (47104 from the cache)` for the retry, whose first token came after 31.9 s;
+  the 1.1.0 build logged `0 from the cache` and took 51.9 s again.
+- **The drafter's proposal is one CUDA graph a stream count** (`BOLT_DRAFT_GRAPH`, default on; item 3 of
+  `docs/speed-research.md`). `draft_propose_multi` used to launch LiLiCorr's five layers, the target head over the seven
+  slots, the candidates and the lattice head eagerly: about 130 launches and six small copies, then one wait, 6.4 ms a
+  round at one stream (`BOLT_DPROF=1`, 2026-10-19). Everything a call varies (which streams, their K/V rings, lengths,
+  positions, anchor tokens) already went through pinned tables copied to the device at the start of the call, and the
+  one thing that did not, the anchor rows copied from each stream's own buffer, now goes through a pinned pointer table
+  and a gather kernel, so the launch sequence for B streams is the same whatever the streams are. The first proposal for
+  B streams is captured (thread-local capture on the engine's stream) and instantiated; later ones replay it, reading the
+  tables as they stand. A capture or instantiation that fails is reported once and turns the graph off for good; the
+  call then runs the same launches eagerly. `BOLT_DPROF=1` also runs eagerly (its events sit between the stages). The
+  load-time calibration measures the proposal with the graph (it captures for one stream and for `PARALLEL` streams
+  there), so the planner prices what it gets. Measured 2026-10-27 on the Spark: the load-time proposal reads 6.4 to 6.5
+  ms with the graph (two loads) and 6.5 ms with `BOLT_DRAFT_GRAPH=0` (19.7 to 19.8 against 19.9 ms for sixteen
+  streams), within the calibration's noise where 1 to 1.5 ms were hoped for: the eager launches were already queued
+  ahead of the device, so the proposal is bound by its kernels, not its launch gaps. Decode alone with the graph
+  against without, medians of three: 137.4 against 136.1 tok/s greedy code, 73.8 against 72.8 prose, 136.1 against 134.4
+  sampled code, 71.8 against 71.8 prose; at eight streams the same within noise. About 1 % alone, nothing in company.
+  Kept on: it costs nothing and takes about 130 launches a round off the host thread. Proposals, not replies, are what
+  this changes: the target checks every draft, and the 108 replies of the comparison hash the same with the graph on
+  and off.
+- **What 1.1.6's host brings this backend without a change here** (measured below; the upstream figures in this
+  paragraph are theirs, on other families): requests that arrive together on a new shared prefix no longer each
+  prefill it, the later ones wait for the first prompt's cut and resume from it (#1321, `TENSORFOLD_PREFIX_WAIT_MS`;
+  eight chat requests on a new 28k-token system prompt: last first token after 31 s instead of 201 s on a GB10 with
+  Qwen3.8-27B); prompt steps share wall time with decoding streams, so a long prompt no longer stalls the streams
+  already decoding (#1188); a burst of short prompts ends after a lane count of them while streams decode (#1287);
+  shared draft rounds offer one deeper row every eighth round when the row cap permits (#1059); the start-up budget on
+  unified memory counts the kernel's parked free pages (#1323); greedy and top-k draws no longer sort the vocabulary
+  (1.1.3) and `top_k 0, top_p 1` draws race instead of sorting (#1337); `return_token_ids` puts a reply's tokens in the
+  `tensorfold` block; `--thinking-reserve`, `--loop-guard` for long verbatim cycles, `--idle-unload`.
+- Checked without a GPU, in a CUDA 13.1 arm64 container on a Mac (`nvidia/cuda:13.1.0-devel-ubuntu24.04`, Zig 0.17.0):
+  the patch applies to a clean v1.1.6 checkout; `zig build compile-bolt-family` compiles the backend against the new lane
+  core; `zig test zig/src/families/nemotron/config.zig` passes (12 passed, 1 skipped); `zig build bolt` compiles libbolt
+  for `sm_121a` with CUDA 13.1's nvcc (7.4 MB, the same four unreferenced-function warnings as before).
+  `zig build test-bolt-host` passes 357 of 359 (1 skipped; the one failure, leaks in `recall_store_test`'s read-only
+  writer test, fails identically on an unpatched v1.1.6 checkout, as the store test did at 1.1.0); `test-vision-cli-host`
+  and `compile-checkpoint-consumers` (the server and the families' checkpoint readers, with the registry change) pass.
+  The whole-program link of `tensorfold-native` was killed for memory in the Mac's 6 GiB Docker VM, so it was done on
+  the Mac itself: Zig 0.17.0 for macOS cross-compiled `zig build -Dtarget=aarch64-linux-gnu -Dfatbins=DIR install
+  native` from the 98 fatbins the container had built (2 min 49 s), a 78.7 MB aarch64 ELF that reports 1.1.6, parses
+  `serve`'s arguments as `start.sh` checks them, and names a synthetic Bolt snapshot (an omni `config.json` around a
+  `nemotron_h_puzzle` model) `Nemotron 3.5 Bolt (nemotron_h_puzzle)` in `tensorfold-native info`; `serve` on it stops
+  at the missing CUDA driver, as it must in that container. The lane core's keyed draw was timed on the Mac with its
+  own `choose`: 0.07 ms for a round of 128 rows of 64 candidates at the recipe's sampling, 0.005 ms greedy, so the
+  host side of a verify round is not where time goes (the Spark's cores are slower, but not by the hundredfold it
+  would take to matter).
+- Checked on the Spark the next day (2026-10-27, dgx03, driver 610.43.02): `scripts/prepare.sh` built
+  `tensorfold-nemotron-bolt:zig-eea9dc9` (24.7 GB; the first attempt stopped at the xgrammar pin, fixed above);
+  `./start.sh restart` loaded in 32.9 s with the same calibration as 1.1.0 (window ms 24.6 to 33.5 for 1 to 8 rows,
+  shared rounds 42.0 ms for 16 rows and 159.6 for 128, 1.05 ms a row; 1.1.0 the same morning: 41.9 and 158.7), the
+  smoke request answered, and the four tables above were measured against the 1.1.0 image restarted on the same
+  machine: 300 replies on one prompt, 144 on sixteen distinct prompts and 108 with the proposal graph off all hash the
+  same as their counterparts (`token_sha256`, and each concurrent reply the same as the request alone). Cold prefill
+  from 2.6k to 126k tokens is the 1.1.0 build's within 1 % (2,375 to 2,525 tok/s down to 1,970). The server left
+  running is this build with its defaults.
 
 ### Prompt attention 2.2 to 2.5× at long context, and the fp4 kernel at 154 TFLOPS
 
