@@ -6,6 +6,7 @@ const cuda = @import("cuda");
 const radio = @import("radio");
 const native = @import("cuda_native.zig");
 const lib = @import("bolt_api.zig");
+const sys = @import("sys");
 pub const vision = native.vision;
 
 pub const model_type = "nemotron_h_puzzle";
@@ -41,11 +42,15 @@ const prior = [_]f64{ 0.80, 0.78, 0.76, 0.74, 0.72, 0.70, 0.68 };
 const Timespec = extern struct { sec: i64, nsec: i64 };
 extern "c" fn clock_gettime(clk: c_int, ts: *Timespec) c_int;
 fn nowMs() f64 {
+    if (sys.windows) {
+        var wts: sys.c.timespec = undefined;
+        _ = sys.c.clock_gettime(sys.c.CLOCK.MONOTONIC, &wts);
+        return @as(f64, @floatFromInt(wts.sec)) * 1000.0 + @as(f64, @floatFromInt(wts.nsec)) / 1e6;
+    }
     var ts: Timespec = undefined;
     _ = clock_gettime(1, &ts);
     return @as(f64, @floatFromInt(ts.sec)) * 1000.0 + @as(f64, @floatFromInt(ts.nsec)) / 1e6;
 }
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 /// What the backend keeps for one live stream: its libbolt sequence, the prompt pass in progress, and the drafts held.
 const Slot = struct {
@@ -498,27 +503,27 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer if (tower) |v| v.deinit();
     var stream: ?cuda.Stream = if (tower != null) try cuda.Stream.init(ctx.d, false) else null;
     errdefer if (stream) |*st| st.deinit();
+    // one libbolt sequence a stream (--parallel), unless BOLT_SEQS says otherwise
+    var seqs_buf: [16]u8 = undefined;
+    _ = sys.env.setenv("BOLT_SEQS", std.fmt.bufPrintSentinel(&seqs_buf, "{d}", .{o.lanes}, 0) catch "1", 0);
+    // no drafter checkpoint is read (or its memory held) when the server runs --no-drafts
+    if (!o.drafts) _ = sys.env.setenv("BOLT_DRAFT_OFF", "1", 1);
     const handle = lib.openLibrary() orelse {
-        std.log.err("bolt: libbolt.so: {s} (zig build bolt -Dnvcc=NVCC installs it beside the server)", .{if (lib.dlerror()) |m| std.mem.span(m) else "not found"});
+        std.log.err("bolt: {s}: {s} (zig build bolt -Dnvcc=NVCC installs it beside the server)", .{ lib.file_name, if (lib.dlerror()) |m| std.mem.span(m) else "not found" });
         return error.BoltMissing;
     };
     const api = try lib.Api.load(handle);
     if (api.abi() != lib.abi_version) {
-        std.log.err("bolt: libbolt.so speaks ABI {d}, this server {d}: build it from the same source", .{ api.abi(), lib.abi_version });
+        std.log.err("bolt: {s} speaks ABI {d}, this server {d}: build it from the same source", .{ lib.file_name, api.abi(), lib.abi_version });
         return error.BoltMissing;
     }
-    // one libbolt sequence a stream (--parallel), unless BOLT_SEQS says otherwise
-    var seqs_buf: [16]u8 = undefined;
-    _ = setenv("BOLT_SEQS", std.fmt.bufPrintSentinel(&seqs_buf, "{d}", .{o.lanes}, 0) catch "1", 0);
-    // no drafter checkpoint is read (or its memory held) when the server runs --no-drafts
-    if (!o.drafts) _ = setenv("BOLT_DRAFT_OFF", "1", 1);
     const path = try gpa.allocSentinel(u8, dir.len, 0);
     defer gpa.free(path);
     @memcpy(path[0..dir.len], dir);
     const model = api.open(path, @intCast(o.context)) orelse return error.BoltLoad;
     const e = try gpa.create(Engine);
     const nseq: u32 = @intCast(@max(1, api.seqs(model)));
-    e.* = .{ .gpa = gpa, .api = api, .model = model, .drafts = o.drafts and api.has_draft(model) != 0, .seqs = nseq, .stat_on = std.c.getenv("BOLT_STATS") != null, .vision = tower, .stream = stream };
+    e.* = .{ .gpa = gpa, .api = api, .model = model, .drafts = o.drafts and api.has_draft(model) != 0, .seqs = nseq, .stat_on = sys.getenv("BOLT_STATS") != null, .vision = tower, .stream = stream };
     for (0..window) |i| costs[i] = .{ .width = @intCast(i + 1), .ms = api.cost(model, @intCast(i + 1)) };
     const propose_ms = api.cost(model, 0);
     const propose_multi_ms = api.draft_multi_cost(model);

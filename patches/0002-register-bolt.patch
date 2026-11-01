@@ -1,9 +1,9 @@
 diff --git a/zig/build/bolt.zig b/zig/build/bolt.zig
 new file mode 100644
-index 00000000..873f58ff
+index 00000000..63eed4b8
 --- /dev/null
 +++ b/zig/build/bolt.zig
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,34 @@
 +//! libbolt, Nemotron 3.5 Bolt's forward pass: an optional library nvcc builds beside the server from -Dbolt-src.
 +
 +const std = @import("std");
@@ -23,13 +23,20 @@ index 00000000..873f58ff
 +        return;
 +    };
 +    const root: std.Build.LazyPath = .{ .cwd_relative = dir };
-+    const run = b.addSystemCommand(&.{ tool, "-shared", "-Xcompiler", "-fPIC", "-O3", "-gencode", "arch=compute_121a,code=sm_121a", "-I" });
++    const windows = b.graph.host.result.os.tag == .windows;
++    const name = if (windows) "bolt.dll" else "libbolt.so";
++    const run = b.addSystemCommand(&.{ tool, "-shared", "-O3", "-gencode", "arch=compute_121a,code=sm_121a" });
++    // Windows: the shared UCRT (/MD) so the server's setenv reaches the library, MSVC's conforming preprocessor and
++    // M_SQRT2 for CUDA 13's headers, C++17 as gcc defaults to, and bolt.def naming the exports
++    if (windows) run.addArgs(&.{ "-std=c++17", "-Xcompiler=/MD,/Zc:preprocessor,/EHsc", "-D_USE_MATH_DEFINES" }) else run.addArgs(&.{ "-Xcompiler", "-fPIC" });
++    run.addArg("-I");
 +    run.addDirectoryArg(root);
 +    run.addArg("-o");
-+    const lib = run.addOutputFileArg("libbolt.so");
-+    for (sources) |name| run.addFileArg(root.path(b, name));
++    const lib = run.addOutputFileArg(name);
++    for (sources) |src_name| run.addFileArg(root.path(b, src_name));
 +    run.addArg("-lcuda");
-+    step.dependOn(&b.addInstallFile(lib, "native/lib/libbolt.so").step);
++    if (windows) run.addPrefixedFileArg("-Xlinker=/DEF:", root.path(b, "bolt.def"));
++    step.dependOn(&b.addInstallFile(lib, b.fmt("native/lib/{s}", .{name})).step);
 +}
 diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
 index 15d6ce02..c4be094f 100644

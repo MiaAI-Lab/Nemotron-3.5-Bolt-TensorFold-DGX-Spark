@@ -234,6 +234,8 @@ python3 scripts/ckptcheck.py ~/.cache/huggingface/hub/models--nvidia--NVIDIA-Nem
 
 `./stop.sh` removes the container.
 
+Windows on ARM (an RTX Spark N1X laptop), without Docker: [docs/windows.md](docs/windows.md).
+
 ## What `start.sh` and `scripts/prepare.sh` do
 
 1. **Setup:** `scripts/prepare.sh` when the image is not the one these settings name, or when any weight is missing from
@@ -420,7 +422,7 @@ scripts/      prepare.sh, config.sh, publish-image.sh, banner.sh, ckptcheck.py (
 patches/      the Bolt registration, applied onto TensorFold at TF_REF
 engine/       bolt_native.zig and bolt_api.zig (lane backend and its libbolt binding), the CUDA sources of libbolt.so
 contract/     bolt.json, the pinned checkpoint's schedule and quant groups
-docs/         engine.md, the backend and the engine; speed-research.md, the stage profiles and the plan
+docs/         engine.md, the backend and the engine; speed-research.md, the stage profiles and the plan; windows.md, the Windows build
 .github/      issue and pull request templates, GitHub Sponsors
 CREDITS.md    who and what this builds on
 CHANGELOG.md  upgrade notes
