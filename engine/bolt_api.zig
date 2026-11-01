@@ -1,13 +1,57 @@
 //! libbolt's C ABI as the Bolt backend sees it: the symbols, resolved once, and where the library is found.
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// The C ABI version of libbolt this backend speaks (`bolt_abi`).
 pub const abi_version: c_int = 3;
 
-extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
-extern "c" fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
-pub extern "c" fn dlerror() ?[*:0]const u8;
-extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, len: usize) isize;
+const windows = builtin.os.tag == .windows;
+/// libbolt.so on Linux, bolt.dll on Windows.
+pub const file_name = if (windows) "bolt.dll" else "libbolt.so";
+
+/// dlopen and its kin, or the Win32 loader.
+const os = if (windows) struct {
+    extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GetModuleFileNameA(module: ?*anyopaque, name: [*]u8, size: u32) callconv(.winapi) u32;
+    fn open(path: [*:0]const u8) ?*anyopaque {
+        return LoadLibraryA(path);
+    }
+    fn sym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque {
+        return GetProcAddress(handle orelse return null, name);
+    }
+    fn err() ?[*:0]const u8 {
+        return null;
+    }
+    fn exe(buf: []u8) ?[]const u8 {
+        const n = GetModuleFileNameA(null, buf.ptr, @intCast(buf.len));
+        return if (n == 0 or n >= buf.len) null else buf[0..n];
+    }
+} else struct {
+    extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
+    extern "c" fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
+    // libc's dlerror, named apart from this file's dlerror() wrapper
+    const c_dlerror = @extern(*const fn () callconv(.c) ?[*:0]const u8, .{ .name = "dlerror" });
+    extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, len: usize) isize;
+    fn open(path: [*:0]const u8) ?*anyopaque {
+        return dlopen(path, 2);
+    }
+    fn sym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque {
+        return dlsym(handle, name);
+    }
+    fn err() ?[*:0]const u8 {
+        return c_dlerror();
+    }
+    fn exe(buf: []u8) ?[]const u8 {
+        const n = readlink("/proc/self/exe", buf.ptr, buf.len - 1);
+        return if (n > 0) buf[0..@intCast(n)] else null;
+    }
+};
+
+/// Why the library did not open, when the loader says (dlerror; Windows gives no text here).
+pub fn dlerror() ?[*:0]const u8 {
+    return os.err();
+}
 
 /// A run of a prompt piece whose embeddings are rows on the device (bolt_prefill_seq_rows).
 pub const RowRun = extern struct { pos: c_int, count: c_int, rows: u64 };
@@ -73,25 +117,24 @@ pub const Api = struct {
     }
 
     fn sym(comptime T: type, handle: ?*anyopaque, name: [*:0]const u8) !T {
-        const p = dlsym(handle, name) orelse {
-            std.log.err("bolt: libbolt.so has no {s}", .{name});
+        const p = os.sym(handle, name) orelse {
+            std.log.err("bolt: {s} has no {s}", .{ file_name, name });
             return error.BoltMissing;
         };
         return @ptrCast(@alignCast(p));
     }
 };
 
-/// libbolt.so: TENSORFOLD_BOLT_LIB, else beside the server (native/lib), else the loader's path.
+/// libbolt: TENSORFOLD_BOLT_LIB, else beside the server (native/lib), else the loader's path.
 pub fn openLibrary() ?*anyopaque {
-    if (std.c.getenv("TENSORFOLD_BOLT_LIB")) |p| return dlopen(p, 2);
+    if (@import("sys").getenv("TENSORFOLD_BOLT_LIB")) |p| return os.open(p.ptr);
     var exe: [std.fs.max_path_bytes]u8 = undefined;
-    const n = readlink("/proc/self/exe", &exe, exe.len - 1);
-    if (n > 0) {
-        const dir = std.fs.path.dirname(exe[0..@intCast(n)]) orelse "";
+    if (os.exe(&exe)) |self| {
+        const dir = std.fs.path.dirname(self) orelse "";
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (std.fmt.bufPrintSentinel(&buf, "{s}/../lib/libbolt.so", .{dir}, 0)) |path| {
-            if (dlopen(path, 2)) |h| return h;
+        if (std.fmt.bufPrintSentinel(&buf, "{s}/../lib/" ++ file_name, .{dir}, 0)) |path| {
+            if (os.open(path)) |h| return h;
         } else |_| {}
     }
-    return dlopen("libbolt.so", 2);
+    return os.open(file_name);
 }

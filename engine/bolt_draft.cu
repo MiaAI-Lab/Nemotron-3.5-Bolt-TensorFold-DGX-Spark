@@ -12,10 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "bolt_port.h"
 
 #define CK(x) do { cudaError_t _e = (x); if (_e != cudaSuccess) { fprintf(stderr, "bolt draft: %s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(_e)); } } while (0)
 
