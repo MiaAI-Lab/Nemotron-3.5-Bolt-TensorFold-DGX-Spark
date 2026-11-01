@@ -883,7 +883,10 @@ int run_blocks(Bolt* b, const SegIn* sg, int nseg, int record, int cand_k, int l
         // the block advanced every segment as if all its rows were kept; keep() cuts it back
         q.conv = record ? (q.conv + rows) % CONV_SLOTS : (q.conv + 1) % CONV_SLOTS;
         if (b->ssm_lazy) {
-            q.pending = 0;              // folded into the state by this block's scan
+            // the earlier pending rows were folded into the state by this block's scan. A record block's own rows
+            // are pending until a keep cuts them back: the round loop skips keep when a window is kept whole (a
+            // one-row step, a full accept), and a verify is advanced as if every row were kept, as in the two-copy path
+            q.pending = record ? rows : 0;
             if (record) q.hist ^= 1;    // the block saved its rows' inputs in the other slot
         } else q.ssm ^= 1;
         q.len += rows;
