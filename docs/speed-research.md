@@ -500,3 +500,120 @@ replies are unchanged (decode 137 code / 73 prose alone, 379 / 280 at sixteen st
 (128 registers) spills and is 15 % slower. What is left in it: the online softmax's rescale of 64 accumulators
 and 18 `exp`s a 32-key step per warp are about as many issue slots as the 64 MMAs, with only eight warps an SM
 to overlap them; a 64-key softmax step or FA3-style lazy rescaling would help but changes the rounding.
+
+## 2026-11-16: more tokens a round (keyed drafts, wider copy windows; TensorFold 1.2.9 checked)
+
+The forward and the proposal sit near what the memory gives (above), so this round of work went after the other factor,
+the tokens a round keeps. Measured on dgx03 with a test server on its own port beside the serving one, which was idle
+during every run quoted (its token counter is read before and after each; runs it moved in were dropped or repeated);
+builds and benchmarks never overlapped. The acceptance and copy tables of this section come from the build against
+TensorFold 1.2.9, the same engine source as the pinned build's.
+
+### Sampling costs little acceptance, and a keyed draft gets more than the greedy one
+
+TensorFold draws a sampled row as `argmax(logit / T + Gumbel(seed, position, token))` over the row's nucleus. Alone,
+sampled replies kept about as many tokens a round as greedy ones (chat 2.98 against 3.05, code 5.82 against 5.95): the
+draws that differ from the target's best token fall mostly where the drafter would have missed anyway. So the room is
+not in "sampling breaks drafts" but in the rows where the target's draw goes to its second or third choice: the walk
+through LiLiCorr's lattice can make the same move, because it can compute the same noise (`walk_k`,
+`BOLT_DRAFT_COUPLE`).
+
+Sixteen seeded prompts (story, essay, explanation, advice, roleplay, email, comparison, history, dialogue, recipe,
+German prose, Python, SQL, Rust, bash, arithmetic), 300 tokens each, temperature 1, top_p 0.95, alone. The replies are
+the same in every row (the target draws them), so the rounds compare directly:
+
+| drafts | rounds for 4,574 tokens | tokens a round | drafts kept | tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| greedy walk (`BOLT_DRAFT_COUPLE=0`) | 1,478 | 3.10 | 37.5 % | 76.4 |
+| keyed, noise weight 0.25 | 1,377 | 3.32 | 38.0 % | 80.6 |
+| keyed, 0.35 | 1,361 | 3.36 | 40.6 % | 82.2 |
+| **keyed, 0.5 (the default)** | **1,338** | **3.42** | 41.1 % | **83.4** |
+| keyed, 0.7 | 1,348 | 3.39 | 43.8 % | 83.7 |
+| keyed, 1 (the target's own draw) | 1,390 | 3.29 | 40.4 % | 80.6 |
+| mean of lattice and backbone logits, 0.5 | 1,374 | 3.33 | 40.3 % | 81.6 |
+
+On the first eight of those prompts: the backbone's own log-probabilities instead of the lattice's edges (`COUPLE=2`)
+786 rounds against the greedy walk's 731, so the lattice is what makes the draw worth following; the noise of the
+neighbouring position (a debugging offset of ±1, since removed) 838 and 816, which is what unrelated noise costs and
+shows the position is the right one. The full weight is not the best because the lattice's edge distribution is flatter than the target's:
+where the target is sure, full-weight noise moves the draft off the token the target keeps. Half weight is the same as
+doubling the lattice's logit scale. By prompt the effect ranges from 16 % fewer rounds (SQL, a story) to a few more
+(roleplay), which is why eight prompts were too few to pick the weight from.
+
+### The eight-row window was the ceiling of every copy
+
+TensorFold's round loop drafts a copy by itself when a reply repeats earlier text (eight matching tokens start one),
+and doubles a copy that landed whole; the widest window a backend takes bounds it. With `VERIFY_MAX` 8, a rewrite sat
+at 7 kept drafts a round, 207 tok/s, and still paid a proposal for every round. Two changes: windows of up to 32 rows
+(`BOLT_WINDOW`), and, where the round loop has it, `copy_first` (a TensorFold 1.2 fact: a stream whose next window a
+copy takes is asked for no drafts, so no proposal runs for it). `copybench.py`: 400 tokens, three runs, alone, each
+reply compared with `"draft": false`; this table is the build against TensorFold 1.2.9, with both changes (on the
+pinned 1.1.6, windows alone: the rewrite 321 greedy and 339 sampled, the JSON edit 309 and 309, the paragraph 256 and
+160, the quote-and-explain prompt 136 and 138):
+
+| prompt | greedy, 8 rows | greedy, 32 rows | sampled, 8 rows | sampled, 32 rows | undrafted |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| rewrite a 500-token Python file with one method renamed | 206.1 | 389.6 | 209.2 | 391.9 | 37.9 |
+| a JSON document with two values changed | 207.5 | 359.9 | 206.4 | 361.3 | 37.9 |
+| a paragraph copied with one word replaced throughout | 196.4 | 290.9 | 153.8 | 176.0 | 37.9 |
+| quote each method of the file, then explain it | 133.9 | 145.7 | 126.3 | 148.1 | 37.9 |
+
+All 32 drafted replies equal their undrafted ones. The window costs 23.8 ms for one row, 32.1 for 8, 41.1 for 16, 56.3
+for 32 (a millisecond a row past eight), so a full 32-row copy round is 31 tokens in 56 ms; the rewrite runs 18 rounds
+for 400 tokens. Copies at long context (`longcopy.py`: documents of numbered sections, three sections to copy, 360
+tokens, greedy and sampled): 341 to 358 tok/s after 3.9k, 4.0k (the reply crosses 4,096 tokens, where the attention's
+key chunks double) and 8.1k tokens of prompt, 334 to 336 after 16.3k, every reply equal to its undrafted one.
+
+What made wide windows cheap to add: the Mamba conv and scan already loop over a segment's rows, the GEMMs sum in an
+order independent of the row count, and the lazy state's saved inputs and the conv ring only needed a slot a row. The
+one kernel with eight rows built in was the window attention (a CTA of eight warps, a query row each); a window is now
+several such CTAs.
+
+### Sixteen streams: not drafting is not faster, and what the load-time table leaves out
+
+The load-time calibration prices a round of sixteen one-row windows at 41 ms and the proposal for sixteen streams at
+20 ms, which makes sixteen plain rows (16 tokens in 41 ms, 390 tok/s) look better than any drafted round the server
+runs (290 to 300 tok/s on sixteen distinct prompts). Measured with TensorFold 1.2's `Model.plain_streams` (rounds of 12
+or more streams draft nothing): **205 tok/s** against 291 sampled and 300 greedy with drafts, each stream one token
+every 75 ms. The backend's own timer (`BOLT_STATS=1`) has the forward of such a round at 76 to 77 ms, with or without
+the drafter loaded (`BOLT_DRAFT_OFF=1`: 74 to 77) and with either state layout (`BOLT_SSM_LAZY=0`: 77), so it is the
+forward, not the host. The calibration is what differs: it rolls every sequence back after each timed block
+(`keep(0)`), so no sequence ever has a kept row to fold into its Mamba state and none of the sixteen 160 MiB states
+is written. Stage profile of real rounds (`BOLT_PROF=1`, sixteen streams of one row, 79.5 ms a block in the
+profiler's eager mode):
+
+| stage | ms a round | share |
+| --- | ---: | ---: |
+| Mamba conv + scan (sixteen states read, folded and written) | 23.8 | 30 % |
+| routed experts up + down (115 distinct experts a layer) | 30.9 | 39 % |
+| Mamba `in_proj` + `out_proj` | 13.9 | 17 % |
+| `lm_head`, router, attention, norms, the rest | 10.9 | 14 % |
+
+So a real round of N streams costs about 2.2 ms a stream more than the table says, the planner learns that as its
+per-stream-count overhead (which is why it drafts deep at sixteen streams: rows are cheap beside a fixed 55 ms), and
+its choice was right. The switch was taken out again. What would move sixteen streams is the state traffic itself
+(NVIDIA's serve command keeps the Mamba cache in bf16, half the bytes, which changes the arithmetic) or the experts;
+committing the lazy state every few rounds instead of every round saves the write half but pays a fold of the pending
+rows a round, about even by estimate, not tried.
+
+### TensorFold 1.2.9 against 1.1.6 for this backend
+
+The same engine source (upstream `6b064a3`) on both hosts, twelve standard cells, medians of three: within 2 % in ten
+cells, sampled code at eight streams 238 against 256 and greedy code at eight 453 against 468 (one run each way). No
+decode gain: the 3,654 commits between the two are mostly other families' kernels, and the host-side changes this
+backend inherits are about the prompt cache and scheduling. What 1.2.9 changes for it:
+
+- `Model.copy_first` exists, so a round a copy takes runs no proposal.
+- A non-zero `presence_penalty` or `frequency_penalty` is a 400 unless the backend applies it (#2166); 1.1.6 served the
+  request without the penalty.
+- The prompt cache reserves room for concurrent requests' states and drops ("trims") the save points that do not fit
+  (#2699's reservation, `prompt_cache_reserve.zig`). A save point is where the prompt pass is cut, and this engine's
+  prompt pass rounds differently for different cuts (a piece of 44 rows runs other GEMM and attention kernels than
+  pieces of 38 and 6). Found with a 2 GiB cache and sixteen distinct prompts at once: 7 of 48 sampled and 3 of 48
+  greedy replies differed from their solo runs with the unchanged engine (2 and 2 with this one); one traced:
+  a 52-token prompt, resumed at token 8 both times, prefilled as 38 + 6 rows alone and as 44 rows in company
+  (`kept 0`, `trimmed 8` in the cache's line), first different token the 50th. With the cache off all 48 match; 1.1.6
+  with the same 2 GiB cache keeps the cuts and all 48 match. With a cache that holds the sixteen states (4 GiB: 14
+  states, 2.6 GiB, `trimmed 0`) all 96 replies of the cell match on 1.2.9 too. Making the prompt pass independent of its cuts (short pieces through the
+  window kernels, which already are, and one set of kernels for long ones) is the real fix and would let the backend
+  declare `chunk_invariant`; it changes the prompt pass's rounding for every prompt, so it wants the perplexity harness.

@@ -42,8 +42,8 @@ struct Layer {
     TNV4W in_projw{}, out_projw{};   // the same in the fp4 MMA's fragment order (BOLT_NV4_FP4)
     float *conv_w = nullptr, *conv_b = nullptr, *A_log = nullptr, *D = nullptr, *dt_bias = nullptr, *gnorm = nullptr;
     float* ssm = nullptr;   // [seq][2][SSM_ELEMS] (one slot a sequence with a lazy state)
-    float *hist_x = nullptr, *hist_dt = nullptr;  // scan inputs of the last record block's rows [BATCH_MAX] (lazy: [seq][2][VERIFY_MAX])
-    float* conv = nullptr;  // [seq][CONV_SLOTS][CONV_ELEMS]
+    float *hist_x = nullptr, *hist_dt = nullptr;  // scan inputs of the last record block's rows [BATCH_MAX] (lazy: [seq][2][win])
+    float* conv = nullptr;  // [seq][win + 1][CONV_ELEMS]
     // moe
     TQ8 fc1{}, fc2{};
     TBF gate{};
@@ -465,6 +465,7 @@ struct Bolt {
         int ingest_floor = 0;           // positions below this never reach the drafter's window
     };
     int nseq = 1;
+    int win = DRAFT_ROWS;           // rows a verify window carries at most (BOLT_WINDOW: 8, 16 or 32)
     std::vector<Seq> seqs;
     int last_cand_k = 0;
     ReplayLayer* replay = nullptr;  // device table, one entry per Mamba layer
@@ -534,6 +535,31 @@ void kv_unmap_granule(Bolt* b, int seq, int g, int nbufs) {
     }
 }
 
+// Memory a growing sequence may still take. On a machine whose GPU memory is the system's (GB10), the driver's "free" is
+// the kernel's free pages alone: files the kernel merely caches (a checkpoint just read, an image just built) are not in
+// it, though it gives them up on demand. Counting only free pages refused a 100k-token prompt its next granule with
+// 40 GiB available (2.6 GiB free after an image build beside the server, 2026-11-16), so MemAvailable, the kernel's
+// own estimate of what can be had without swapping, counts where it is larger. 0 where /proc/meminfo is not there.
+size_t host_available() {
+#ifdef _WIN32
+    return 0;
+#else
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[160];
+    unsigned long long kb = 0;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+    fclose(f);
+    return (size_t)kb * 1024;
+#endif
+}
+size_t kv_room() {
+    size_t fr = 0, tot = 0;
+    cudaMemGetInfo(&fr, &tot);
+    return std::max(fr, std::min(host_available(), tot));
+}
+
 // Map physical memory under the first `tokens` rows of the sequence. False when the driver or the free memory refuses.
 bool kv_ensure(Bolt* b, int seq, int tokens) {
     KvPool& k = b->kv;
@@ -548,10 +574,9 @@ bool kv_ensure(Bolt* b, int seq, int tokens) {
     acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     while (k.mapped[seq] < need) {
         const int g = k.mapped[seq];
-        size_t fr = 0, tot = 0;
-        cudaMemGetInfo(&fr, &tot);
+        const size_t fr = kv_room();
         if (fr < k.reserve_free + (size_t)nbuf * k.gran) {
-            fprintf(stderr, "bolt: no memory to grow sequence %d past %d tokens (%.1f GiB free)\n", seq, g * k.tokens_per_gran, fr / 1073741824.0);
+            fprintf(stderr, "bolt: no memory to grow sequence %d past %d tokens (%.1f GiB available)\n", seq, g * k.tokens_per_gran, fr / 1073741824.0);
             return false;
         }
         int done = 0;
@@ -738,7 +763,7 @@ int bucket_of(int nseg) { return nseg <= 1 ? 0 : nseg <= 2 ? 1 : nseg <= 4 ? 2 :
 constexpr int BUCKET_SEGS[5] = {1, 2, 4, 8, 16};
 
 int graph_key(int T, int record, int cand_k, int last_only, int bucket, int split_log) {
-    return (((((T * 2 + record) * 2 + last_only) * 5 + bucket) * 6 + split_log) * 128) + cand_k;
+    return (((((T * 2 + record) * 2 + last_only) * 5 + bucket) * 7 + split_log) * 128) + cand_k;   // split_log 0..6
 }
 
 // Hand the drafter the target features of the rows it has not seen. Old prompt rows outside its window are skipped.
@@ -786,12 +811,13 @@ int split_log_of(const SegIn* sg, int nseg, const Bolt* b) {
         const int base0 = b->seqs[sg[i].seq].len, chunk = win_chunk(base0);
         need = std::max(need, (base0 + sg[i].rows + chunk - 1) / chunk);
     }
-    while ((1 << lg) < need && lg < 5) lg++;
+    // 32 chunks reach a drafted window's end; a wider window that starts within its width of their end needs a 33rd
+    while ((1 << lg) < need && lg < 6) lg++;
     return lg;
 }
 
 // Run one block: a segment of rows for each of nseg distinct sequences. A record block (verify windows, up to
-// VERIFY_MAX rows a segment) can be cut back per sequence by keep; any other block is a single segment. Returns 0
+// b->win rows a segment) can be cut back per sequence by keep; any other block is a single segment. Returns 0
 // on success.
 struct EmbedPatch { int row; const uint16_t* src; int n; };   // rows [row, row + n) of the block come from src (device bf16)
 
@@ -801,7 +827,7 @@ int run_blocks(Bolt* b, const SegIn* sg, int nseg, int record, int cand_k, int l
     for (int i = 0; i < nseg; i++) {
         if (sg[i].seq < 0 || sg[i].seq >= b->nseq || sg[i].rows < 1) return -1;
         for (int j = 0; j < i; j++) if (sg[j].seq == sg[i].seq) return -1;
-        if (record && sg[i].rows > VERIFY_MAX) return -1;
+        if (record && sg[i].rows > b->win) return -1;
         if (b->seqs[sg[i].seq].len + sg[i].rows > b->context) return -2;
         if (!kv_ensure(b, sg[i].seq, b->seqs[sg[i].seq].len + sg[i].rows)) return -4;
         T += sg[i].rows;
@@ -827,6 +853,15 @@ int run_blocks(Bolt* b, const SegIn* sg, int nseg, int record, int cand_k, int l
     h->seg_row0[nseg] = row;
     h->nrows = T;
     h->nseg = nseg;
+    h->win = b->win;
+    if (record) {   // the windows' attention in query blocks of WIN_Q rows
+        int nqb = 0;
+        for (int i = 0; i < nseg; i++) {
+            h->seg_qb0[i] = nqb;
+            for (int off = 0; off < sg[i].rows; off += WIN_Q) { h->qb_seg[nqb] = i; h->qb_off[nqb] = off; nqb++; }
+        }
+        h->nqb = nqb;
+    }
     CK(cudaMemcpyAsync(b->ctl_d, h, sizeof(Ctl), cudaMemcpyHostToDevice, b->s0));
     for (int i = 0; i < npatch; i++)
         CK(cudaMemcpyAsync(b->xemb + (size_t)patches[i].row * HID, patches[i].src, (size_t)patches[i].n * HID * 2, cudaMemcpyDeviceToDevice, b->s0));
@@ -835,7 +870,7 @@ int run_blocks(Bolt* b, const SegIn* sg, int nseg, int record, int cand_k, int l
     // Shared blocks come in many sizes: round the rows up so a handful of captured graphs serve them all. The extra rows
     // are embedded from token 0 and touch no sequence's state (the kernels stop at ctl->nrows).
     const int real_rows = T;
-    if (record && (nseg > 1 || T > VERIFY_MAX)) T = T <= 64 ? (T + 7) / 8 * 8 : (T + 15) / 16 * 16;
+    if (record && (nseg > 1 || T > b->win)) T = T <= 64 ? (T + 7) / 8 * 8 : (T + 15) / 16 * 16;
     int key = graph_key(T, record, cand_k, last_only, bucket, split_log);
     auto it = b->graphs.find(key);
     if (b->prof) {
@@ -881,7 +916,7 @@ int run_blocks(Bolt* b, const SegIn* sg, int nseg, int record, int cand_k, int l
         q.ing_n = rows;
         q.ing_row0 = h->seg_row0[i];
         // the block advanced every segment as if all its rows were kept; keep() cuts it back
-        q.conv = record ? (q.conv + rows) % CONV_SLOTS : (q.conv + 1) % CONV_SLOTS;
+        q.conv = record ? (q.conv + rows) % (b->win + 1) : (q.conv + 1) % (b->win + 1);
         if (b->ssm_lazy) {
             // the earlier pending rows were folded into the state by this block's scan. A record block's own rows
             // are pending until a keep cuts them back: the round loop skips keep when a window is kept whole (a
@@ -937,6 +972,13 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
         for (auto& t : types) n_att += t == "attention";
         const char* lz = getenv("BOLT_SSM_LAZY");
         b->ssm_lazy = lz && atoi(lz) != 0;
+        // a verify window's most rows: 8 holds every drafted window; 16 and 32 take a longer copy of earlier text in one
+        // forward (a rewrite or an edit: 207 tok/s at 8 rows, 320 to 340 at 32), for 0.05 and 0.18 GiB more state a stream
+        if (const char* wn = getenv("BOLT_WINDOW")) {
+            const int w = atoi(wn);
+            if (w == 8 || w == 16 || w == 32) b->win = w;
+            else fprintf(stderr, "bolt: BOLT_WINDOW=%s is not 8, 16 or 32: windows of %d rows\n", wn, b->win);
+        }
         const char* st = getenv("BOLT_SHARED_TILE");   // 0 keeps the shared expert's bf16 path for prompt chunks
         b->shared_tile = !(st && atoi(st) == 0);
         const char* sd = getenv("BOLT_SHARED_DECODE");
@@ -969,11 +1011,11 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
             ly.D = dev_f32(store, p + ".mixer.D");
             ly.dt_bias = dev_f32(store, p + ".mixer.dt_bias");
             ly.gnorm = dev_f32(store, p + ".mixer.norm.weight");
-            const size_t slots = b->ssm_lazy ? 1 : 2, hist_rows = b->ssm_lazy ? (size_t)b->nseq * 2 * VERIFY_MAX : BATCH_MAX;
+            const size_t slots = b->ssm_lazy ? 1 : 2, hist_rows = b->ssm_lazy ? (size_t)b->nseq * 2 * b->win : BATCH_MAX;
             CK(cudaMalloc(&ly.ssm, (size_t)b->nseq * slots * SSM_ELEMS * 4));
-            CK(cudaMalloc(&ly.conv, (size_t)b->nseq * CONV_SLOTS * CONV_ELEMS * 4));
+            CK(cudaMalloc(&ly.conv, (size_t)b->nseq * (b->win + 1) * CONV_ELEMS * 4));
             CK(cudaMemset(ly.ssm, 0, (size_t)b->nseq * slots * SSM_ELEMS * 4));
-            CK(cudaMemset(ly.conv, 0, (size_t)b->nseq * CONV_SLOTS * CONV_ELEMS * 4));
+            CK(cudaMemset(ly.conv, 0, (size_t)b->nseq * (b->win + 1) * CONV_ELEMS * 4));
             CK(cudaMalloc(&ly.hist_x, hist_rows * HIST_ROW * 4));
             CK(cudaMalloc(&ly.hist_dt, hist_rows * 128 * 4));
             CK(cudaMemset(ly.hist_x, 0, hist_rows * HIST_ROW * 4));
@@ -1053,7 +1095,7 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
     zalloc(&b->qb, (size_t)TMAX * 4096);
     zalloc(&b->kb, (size_t)TMAX * 256);
     zalloc(&b->vb, (size_t)TMAX * 256);
-    zalloc(&b->apart, std::max({(size_t)16 * 2 * ATT_SPLITS * ATT_PART_FLOATS, (size_t)64 * 2 * 16 * ATT_PART_FLOATS, (size_t)BATCH_MAX * 2 * 8 * ATT_PART_FLOATS, attn_mma_part_floats(255, 16), attn_mma_part_floats(TMAX, 4), (size_t)SEG_MAX * 2 * 32 * (8 * (32 + 16 * 128))}));  // the blocked kernel's partials fit: (T/4)*2*16*(64*130) floats
+    zalloc(&b->apart, std::max({(size_t)16 * 2 * ATT_SPLITS * ATT_PART_FLOATS, (size_t)64 * 2 * 16 * ATT_PART_FLOATS, (size_t)BATCH_MAX * 2 * 8 * ATT_PART_FLOATS, attn_mma_part_floats(255, 16), attn_mma_part_floats(TMAX, 4), (size_t)QB_MAX * 2 * 32 * (8 * (32 + 16 * 128))}));  // the blocked kernel's partials fit: (T/4)*2*16*(64*130) floats
     zalloc(&b->aout, (size_t)TMAX * 4096);
     zalloc(&b->glog, (size_t)TMAX * 512);
     zalloc(&b->lat, (size_t)TMAX * 1024);
@@ -1136,7 +1178,9 @@ extern "C" Bolt* bolt_load(const char* dir) {
 
 
 // The C ABI version bolt_native.zig checks at load: bump it with any change to the calls below.
-extern "C" int bolt_abi() { return 3; }
+extern "C" int bolt_abi() { return 4; }
+// Rows a sequence's verify window carries at most in this model (BOLT_WINDOW: 8, 16 or 32).
+extern "C" int bolt_window(Bolt* b) { return b->win; }
 
 extern "C" int bolt_seqs(Bolt* b) { return b->nseq; }
 extern "C" int bolt_context(Bolt* b) { return b->context; }
@@ -1144,8 +1188,8 @@ extern "C" int bolt_context(Bolt* b) { return b->context; }
 // Device bytes one more sequence holds at this context: both SSM slots and the conv ring of every Mamba layer, the
 // KV rows of every attention layer, the drafter's rings.
 extern "C" uint64_t bolt_seq_bytes(Bolt* b) {
-    const uint64_t ssm = b->ssm_lazy ? (uint64_t)SSM_ELEMS + 2ull * VERIFY_MAX * (HIST_ROW + 128) : 2 * (uint64_t)SSM_ELEMS;
-    return (uint64_t)b->mamba_layers * (ssm + (uint64_t)CONV_SLOTS * CONV_ELEMS) * 4 + (uint64_t)(b->kv.lazy && !b->kv_pin ? b->kv.tokens_per_gran : b->context) * kv_token_bytes(b) +
+    const uint64_t ssm = b->ssm_lazy ? (uint64_t)SSM_ELEMS + 2ull * b->win * (HIST_ROW + 128) : 2 * (uint64_t)SSM_ELEMS;
+    return (uint64_t)b->mamba_layers * (ssm + (uint64_t)(b->win + 1) * CONV_ELEMS) * 4 + (uint64_t)(b->kv.lazy && !b->kv_pin ? b->kv.tokens_per_gran : b->context) * kv_token_bytes(b) +
            (b->draft ? draft_blob_bytes() : 0);
 }
 
@@ -1156,20 +1200,26 @@ extern "C" int bolt_propose_seq(Bolt* b, int seq, int anchor, int* out) {
     return draft_propose(b->draft, seq, anchor, b->seqs[seq].len, out, b->s0);
 }
 
-// Drafts for several sequences in one pass over the drafter's weights: out is [n][8], got[i] is 7 or 0.
-extern "C" void bolt_propose_multi(Bolt* b, int n, const int* seqs, const int* anchors, int* out, int* got) {
+// Drafts for several sequences in one pass over the drafter's weights: out is [n][8], got[i] is 7 or 0. draws[i] is
+// how stream i's target rows are drawn (BoltDraw, bolt_draft.h), so a sampled stream's drafts are drawn with the same
+// keyed noise; null drafts every stream greedily.
+extern "C" void bolt_propose_draws(Bolt* b, int n, const int* seqs, const int* anchors, const BoltDraw* draws, int* out, int* got) {
     int pos[SEG_MAX];
     if (!b->draft || n < 1 || n > SEG_MAX) { for (int i = 0; i < n; i++) got[i] = 0; return; }
     flush_all_ingest(b);
     for (int i = 0; i < n; i++) pos[i] = b->seqs[seqs[i]].len;
-    draft_propose_multi(b->draft, n, seqs, anchors, pos, out, got, b->s0);
+    draft_propose_multi(b->draft, n, seqs, anchors, pos, out, got, b->s0, draws);
+}
+
+extern "C" void bolt_propose_multi(Bolt* b, int n, const int* seqs, const int* anchors, int* out, int* got) {
+    bolt_propose_draws(b, n, seqs, anchors, nullptr, out, got);
 }
 
 extern "C" int bolt_has_draft(Bolt* b) { return b->draft != nullptr; }
 // Measured forward time in ms for a verify window of `width` rows, and for one proposal (width 0).
 extern "C" double bolt_cost(Bolt* b, int width) {
     if (width == 0) return b->draft_ms;
-    if (width < 1 || width > VERIFY_MAX) return 0;
+    if (width < 1 || width > b->win) return 0;
     return b->cost_ms[width];
 }
 // Proposal ms for a call over all the sequences (0 when there is one).
@@ -1196,7 +1246,7 @@ extern "C" void bolt_reset_seq(Bolt* b, int seq) {
     q.used = used;
     for (Layer& ly : b->layers) if (ly.type == 0) {
         CK(cudaMemsetAsync(ly.ssm + (size_t)seq * (b->ssm_lazy ? 1 : 2) * SSM_ELEMS, 0, (size_t)SSM_ELEMS * 4, b->s0));
-        CK(cudaMemsetAsync(ly.conv + (size_t)seq * CONV_SLOTS * CONV_ELEMS, 0, (size_t)CONV_ELEMS * 4, b->s0));
+        CK(cudaMemsetAsync(ly.conv + (size_t)seq * (b->win + 1) * CONV_ELEMS, 0, (size_t)CONV_ELEMS * 4, b->s0));
     }
     CK(cudaStreamSynchronize(b->s0));
     draft_reset(b->draft, seq);
@@ -1282,7 +1332,7 @@ static bool keep_rows(Bolt* b, int seq, int n) {
         q.ssm = n == 0 ? q.last_ssm : (q.last_ssm ^ 1);
         q.last_rows = n;
     }
-    q.conv = (q.last_conv + n) % CONV_SLOTS;
+    q.conv = (q.last_conv + n) % (b->win + 1);
     q.len = q.last_len + n;
     q.ing_n = n;
     return launched;
@@ -1306,7 +1356,7 @@ extern "C" void bolt_keep_multi(Bolt* b, int n, const int* seqs, const int* coun
 static void fold_pending(Bolt* b, int seq) {
     Bolt::Seq& q = b->seqs[seq];
     if (!b->ssm_lazy || q.pending <= 0) return;
-    k_scan_fold(b->s0, b->replay, b->mamba_layers, seq, q.hist, q.pending);
+    k_scan_fold(b->s0, b->replay, b->mamba_layers, seq, q.hist, q.pending, b->win);
     q.pending = 0;
 }
 
@@ -1371,7 +1421,7 @@ extern "C" int bolt_prefill(Bolt* b, const int* tokens, int n, int cand_k) {
     bolt_prompt_end(b, 0, b->seqs[0].len + n);
     return bolt_prefill_seq(b, 0, tokens, n, cand_k);
 }
-// One sequence's block of up to TMAX rows (record: a verify window of up to VERIFY_MAX rows).
+// One sequence's block of up to TMAX rows (record: a verify window of up to b->win rows).
 extern "C" int bolt_forward_seq(Bolt* b, int seq, const int* tokens, int T, int record, int cand_k) { return run_block(b, seq, tokens, T, record, cand_k); }
 // Run T rows. record keeps per-row mamba state so bolt_keep can roll back (T <= 8).
 extern "C" int bolt_forward(Bolt* b, const int* tokens, int T, int record, int cand_k) { return run_block(b, 0, tokens, T, record, cand_k); }
@@ -1429,7 +1479,7 @@ static void bolt_calibrate(Bolt* b) {
     auto now = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     int toks[BATCH_MAX];
     for (int i = 0; i < BATCH_MAX; i++) toks[i] = 1000 + 37 * (i % 61);
-    for (int w = 1; w <= VERIFY_MAX; w++) {
+    for (int w = 1; w <= b->win; w++) {
         double best = 1e30;
         for (int rep = 0; rep < 5; rep++) {
             double t0 = now();
@@ -1441,8 +1491,11 @@ static void bolt_calibrate(Bolt* b) {
         }
         b->cost_ms[w] = best;
     }
+    // a wider window is never cheaper: an entry above a later one was a slow run (12 rows 40.4 ms beside 13 rows 38.6),
+    // and the planner would shun that width, so the later entry bounds it
+    for (int w = b->win - 1; w >= 1; w--) if (b->cost_ms[w] > b->cost_ms[w + 1]) b->cost_ms[w] = b->cost_ms[w + 1];
     if (b->nseq > 1) {
-        // total rows R as segments of up to VERIFY_MAX rows over distinct sequences, each with tokens of its own so
+        // total rows R as segments of up to DRAFT_ROWS rows over distinct sequences, each with tokens of its own so
         // the rows route to different experts like real streams do
         int mix[BATCH_MAX];
         for (int i = 0; i < BATCH_MAX; i++) mix[i] = 1000 + (int)((i * 2654435761u + 12345u) % 90000u);
@@ -1465,7 +1518,7 @@ static void bolt_calibrate(Bolt* b) {
             // recurrent state of every sequence in the block is read and written whatever its rows
             for (int R : {2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128}) {
                 int nseg = R < b->nseq ? R : b->nseq;
-                if (R > nseg * VERIFY_MAX) continue;
+                if (R > nseg * DRAFT_ROWS) continue;
                 int rows[SEG_MAX];
                 for (int i = 0; i < nseg; i++) rows[i] = R / nseg + (i < R % nseg ? 1 : 0);
                 double best = shared(nseg, rows);
@@ -1488,13 +1541,13 @@ static void bolt_calibrate(Bolt* b) {
                 if (per == 1) { ms1 = best; r1 = R; } else { ms8 = best; r8 = R; }
             }
             double slope = r8 > r1 && ms8 > ms1 ? (ms8 - ms1) / (r8 - r1) : 0;
-            if (slope <= 0) slope = (b->cost_ms[VERIFY_MAX] - b->cost_ms[1]) / (VERIFY_MAX - 1);
+            if (slope <= 0) slope = (b->cost_ms[DRAFT_ROWS] - b->cost_ms[1]) / (DRAFT_ROWS - 1);
             if (slope < 0.1) slope = 0.1;
             fprintf(stderr, "bolt: shared rounds of %d streams: %d rows %.1f ms, %d rows %.1f ms; %.2f ms a row\n", b->nseq, r1, ms1, r8, ms8, slope);
             for (int R : {2, 4, 8}) b->shared_ms.push_back({R, b->cost_ms[R]});
             for (int R : {12, 16, 24, 32, 48, 64, 96, 128}) {
-                if (R > b->nseq * VERIFY_MAX || R > BATCH_MAX) break;
-                b->shared_ms.push_back({R, b->cost_ms[VERIFY_MAX] + slope * (R - VERIFY_MAX)});
+                if (R > b->nseq * DRAFT_ROWS || R > BATCH_MAX) break;
+                b->shared_ms.push_back({R, b->cost_ms[DRAFT_ROWS] + slope * (R - DRAFT_ROWS)});
             }
         }
     }
@@ -1531,7 +1584,7 @@ static void bolt_calibrate(Bolt* b) {
     }
     for (int i = 0; i < b->nseq; i++) bolt_reset_seq(b, i);
     fprintf(stderr, "bolt: window ms");
-    for (int w = 1; w <= VERIFY_MAX; w++) fprintf(stderr, " %d:%.1f", w, b->cost_ms[w]);
+    for (int w = 1; w <= b->win; w++) fprintf(stderr, " %d:%.1f", w, b->cost_ms[w]);
     fprintf(stderr, "; proposal %.1f ms", b->draft_ms);
     if (b->draft_multi_ms > 0) fprintf(stderr, " (%d streams %.1f ms)", b->nseq, b->draft_multi_ms);
     if (!b->shared_ms.empty()) {
@@ -1595,7 +1648,7 @@ extern "C" void* bolt_snap_save_seq(Bolt* b, int seq, int at) {
     for (Layer& ly : b->layers) {
         if (ly.type == 0) {
             CK(cudaMemcpyAsync(sn->ssm + (size_t)mi * SSM_ELEMS, ly.ssm + ((size_t)seq * slots + q.ssm) * SSM_ELEMS, (size_t)SSM_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
-            CK(cudaMemcpyAsync(sn->conv + (size_t)mi * CONV_ELEMS, ly.conv + ((size_t)seq * CONV_SLOTS + q.conv) * CONV_ELEMS, (size_t)CONV_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
+            CK(cudaMemcpyAsync(sn->conv + (size_t)mi * CONV_ELEMS, ly.conv + ((size_t)seq * (b->win + 1) + q.conv) * CONV_ELEMS, (size_t)CONV_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
             mi++;
         } else if (ly.type == 2) {
             uint8_t* dst = sn->kv + (size_t)ai * lay;
@@ -1629,7 +1682,7 @@ extern "C" int bolt_snap_restore_seq(Bolt* b, int seq, void* handle) {
     for (Layer& ly : b->layers) {
         if (ly.type == 0) {
             CK(cudaMemcpyAsync(ly.ssm + (size_t)seq * slots * SSM_ELEMS, sn->ssm + (size_t)mi * SSM_ELEMS, (size_t)SSM_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
-            CK(cudaMemcpyAsync(ly.conv + (size_t)seq * CONV_SLOTS * CONV_ELEMS, sn->conv + (size_t)mi * CONV_ELEMS, (size_t)CONV_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
+            CK(cudaMemcpyAsync(ly.conv + (size_t)seq * (b->win + 1) * CONV_ELEMS, sn->conv + (size_t)mi * CONV_ELEMS, (size_t)CONV_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
             mi++;
         } else if (ly.type == 2) {
             const uint8_t* src = sn->kv + (size_t)ai * lay;

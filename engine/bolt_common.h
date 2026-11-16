@@ -8,16 +8,23 @@ constexpr int TMAX = 2048;     // most rows one block forward carries (prompt ch
 constexpr int BATCH_MAX = 128; // most rows of a block that carries several sequences' verify windows
 constexpr int LOGIT_ROWS = BATCH_MAX; // rows whose logits are kept (verify windows and the last prompt row)
 constexpr int SEG_MAX = 16;    // most sequences in one block
-constexpr int VERIFY_MAX = 8;  // most rows one sequence's verify window carries
-constexpr int CONV_SLOTS = VERIFY_MAX + 1;  // conv state slots a sequence keeps (one per window row, plus the start)
+// Rows one sequence's verify window carries at most, in any model: a model's own limit is its `win` (BOLT_WINDOW: 8, 16
+// or 32, set at load). The drafter proposes seven tokens, so eight rows hold every drafted window; a wider one lets the
+// lane core verify a longer copy of earlier text in one forward, for a conv ring (win + 1 slots) and saved scan inputs
+// (two slots of win rows) that grow with it: 0.28 GiB a stream at 8, 0.33 at 16, 0.46 at 32.
+constexpr int VERIFY_MAX = 32;
+constexpr int DRAFT_ROWS = 8;  // rows of a drafted window: the pending token and the drafter's seven
+constexpr int WIN_Q = 8;       // query rows one CTA of a window's attention carries
+constexpr int QB_MAX = (BATCH_MAX + (WIN_Q - 1) * SEG_MAX) / WIN_Q;  // most query blocks a shared round's windows split into
 constexpr int HIST_ROW = 10240;             // floats a saved scan-input row holds (x after the conv, B, C)
 
-// Keys one CTA of a verify window's attention covers: 128, doubled until 32 CTAs reach the end of the sequence and its
-// window. It depends on the sequence's own length alone, so a stream's rounding is the same alone, among other streams,
-// or in a wider window; the split of the keys is the only part of the forward whose order depended on the batch.
+// Keys one CTA of a verify window's attention covers: 128, doubled until 32 CTAs reach the end of the sequence and a
+// drafted window. It depends on the sequence's own length alone, so a stream's rounding is the same alone, among other
+// streams, or in a wider window; the split of the keys is the only part of the forward whose order depended on the batch.
+// (A window wider than DRAFT_ROWS that starts within its width of 32 chunks' end takes a 33rd chunk: split_log_of.)
 __host__ __device__ inline int win_chunk(int base0) {
     int k = 128;
-    while (k * 32 < base0 + VERIFY_MAX) k *= 2;
+    while (k * 32 < base0 + DRAFT_ROWS) k *= 2;
     return k;
 }
 constexpr int HID = 4096;
@@ -61,10 +68,17 @@ struct Ctl {
     int seg_ssm[SEG_MAX];       // its SSM slot to read (0 or 1; the other one is written; always 0 with a lazy state)
     int seg_conv[SEG_MAX];      // its conv ring slot to read
     // Lazy SSM state (BOLT_SSM_LAZY=1): a sequence keeps one state slot and folds the kept rows of its last window into
-    // it at the start of its next block's scan, from the scan inputs the conv saved per sequence (two slots of VERIFY_MAX
+    // it at the start of its next block's scan, from the scan inputs the conv saved per sequence (two slots of `win`
     // rows: seg_hist is the slot holding the rows to fold, the block's own rows go to the other one).
     int seg_replay[SEG_MAX];    // rows of the last window to fold in first (0 without a lazy state)
     int seg_hist[SEG_MAX];      // the saved-input slot they are in
+    // A verify window's attention runs in query blocks of WIN_Q rows (one CTA each): block q covers the rows from
+    // qb_off[q] of segment qb_seg[q], and seg_qb0[i] is segment i's first block. A window of up to WIN_Q rows is one block.
+    int win;                    // rows a window carries at most in this model: its conv ring has win + 1 slots
+    int nqb;
+    int qb_seg[QB_MAX];
+    int qb_off[QB_MAX];
+    int seg_qb0[SEG_MAX];
 };
 
 struct Q8Multi {
@@ -165,10 +179,10 @@ void repack_iq2(cudaStream_t s, const uint8_t* src, uint8_t* qs, void* d, size_t
 void k_embed(cudaStream_t s, const uint16_t* table, const uint16_t* extra, const Ctl* ctl, float* x, int T);
 void k_add_rms(cudaStream_t s, float* x, const float* r1, const float* r2, const float* w, float* xn, float* cap,
                int cap_stride, float eps, int T);
-// Conv state: pool + seq * CONV_SLOTS * CONV_ELEMS + slot * CONV_ELEMS. A record block writes the state after every row
+// Conv state: pool + seq * (win + 1) * CONV_ELEMS + slot * CONV_ELEMS. A record block writes the state after every row
 // into the next slots of the ring (so a window can be cut anywhere); otherwise only the state after the segment, one on.
 // hist_x / hist_dt: a record block saves each row's scan inputs there, by block row; with `lazy` they are per-sequence
-// pools ([seq][2][VERIFY_MAX] rows) and the row goes to slot seg_hist ^ 1 of its sequence, at its index in the segment.
+// pools ([seq][2][win] rows) and the row goes to slot seg_hist ^ 1 of its sequence, at its index in the segment.
 void k_conv(cudaStream_t s, const Ctl* ctl, float* conv_pool, const float* w, const float* b,
             const float* proj, int ldp, float* xbc, int T, int record, float* hist_x, float* hist_dt, int nseg, int lazy);
 // SSM state: pool + seq * 2 * SSM_ELEMS + slot * SSM_ELEMS; the segment reads its slot and writes the other one.
@@ -204,11 +218,12 @@ struct ReplayLayer { float *ssm, *A_log, *dt_bias, *hist_x, *hist_dt; };
 // `slot` of sequence `seq`, write the other slot.
 void k_scan_replay(cudaStream_t s, const ReplayLayer* layers, int nlayers, int seq, int slot, int row0, int n);
 // Lazy state: fold the first n saved rows of hist slot `hslot` of the sequence into its one state slot, in place.
-void k_scan_fold(cudaStream_t s, const ReplayLayer* layers, int nlayers, int seq, int hslot, int n);
+void k_scan_fold(cudaStream_t s, const ReplayLayer* layers, int nlayers, int seq, int hslot, int n, int win);
 // Prompt attention on tensor cores (bolt_mma.cu); part must hold attn_mma_part_floats(T, splits) floats.
 void k_attn_mma(cudaStream_t s, const Ctl* ctl, const float* q, const KvView& kv, float* part, float* out, int T, int splits);
 size_t attn_mma_part_floats(int T, int splits);
-// The same for verify windows: one CTA per sequence's window (up to 8 rows), nseg a launch bound, part holds nseg * 2 * splits * 16640 floats.
+// The same for verify windows: one CTA per query block of a sequence's window (WIN_Q rows; ctl->nqb blocks), nseg a launch
+// bound on the sequences, part holds QB_MAX * 2 * splits * 16640 floats.
 void k_attn_mma_windows(cudaStream_t s, const Ctl* ctl, const float* q, const KvView& kv, float* part, float* out,
                         int T, int nseg, int splits);
 

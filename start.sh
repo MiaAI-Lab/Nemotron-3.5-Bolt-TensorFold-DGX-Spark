@@ -17,6 +17,7 @@
 #   engine   every TENSORFOLD_* variable goes into the container (TENSORFOLD_API_KEY by name only)
 #            KV_DTYPE is bf16 (default) or fp8 (e4m3 with a scale per token and head: half the KV memory). VISION=1 (default) loads the image and video tower; VISION_MAX_IMAGES / _MAX_VIDEOS / _IMAGE_TOKENS / _VIDEO_TOKENS size it.
 #            SSM_LAZY=0 keeps two Mamba state copies a stream (see scripts/config.sh); DRAFT_Q8=0 keeps the drafter's projections bf16; NV4_FP4=0 keeps the prompt pass's projections on fp16 rows.
+#            WINDOW is 32 (default), 16 or 8: the rows a verify window carries at most, so a copy of earlier text is checked in one longer forward.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
@@ -35,6 +36,7 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
 for v in THINKING DRAFTS VISION VISION_URLS SERVE KV_PIN SSM_LAZY DRAFT_Q8 NV4_FP4; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$KV_DTYPE" =~ ^(bf16|fp8)$ ]] || die "KV_DTYPE is bf16 or fp8, not $KV_DTYPE (the engine has no int8 or int4 cache)"
+[[ "$WINDOW" =~ ^(8|16|32)$ ]] || die "WINDOW is 8, 16 or 32, not $WINDOW"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 
 # The native server refuses --kv-dtype ("not served by the native engine yet"). KV stays the engine's own.
@@ -63,7 +65,7 @@ arg_value() {
 }
 # libbolt keeps one sequence of state per stream (--parallel, which the backend passes on); its cache type and pinning,
 # the Mamba state's copies and the drafter's weight format
-ENV_SEQS=(-e "BOLT_KV=$KV_DTYPE" -e "BOLT_KV_PIN=$KV_PIN" -e "BOLT_SSM_LAZY=$SSM_LAZY" -e "BOLT_DRAFT_Q8=$DRAFT_Q8" -e "BOLT_NV4_FP4=$NV4_FP4")
+ENV_SEQS=(-e "BOLT_KV=$KV_DTYPE" -e "BOLT_KV_PIN=$KV_PIN" -e "BOLT_SSM_LAZY=$SSM_LAZY" -e "BOLT_DRAFT_Q8=$DRAFT_Q8" -e "BOLT_NV4_FP4=$NV4_FP4" -e "BOLT_WINDOW=$WINDOW")
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
 [[ "$API_HOST" == *:* ]] && API_HOST="[$API_HOST]"
 URL="http://$API_HOST:$PORT"

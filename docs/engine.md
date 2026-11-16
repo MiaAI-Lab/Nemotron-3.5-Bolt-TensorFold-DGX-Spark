@@ -28,24 +28,32 @@ head of the queue.
 | --- | --- |
 | `prefill_step` | takes a sequence, resumes it from a kept prompt state when the cache has one, then runs the prompt in pieces (2048 rows alone, 512 while other streams decode, cut at the cache's marks) so a cancel lands quickly and the other streams' rounds run between pieces |
 | `first` / `queue` / `first_masked` | the keyed draw of one row at the given position; `first_masked` draws the first token again among the tokens a grammar's mask allows |
-| `verify` | **one forward over every stream's window** (up to 16 windows, 128 rows): `pending`, the held drafts and any host drafts, each row drawn with its stream's `Sampling` at its own position (among the allowed tokens when the window carries a grammar's masks) |
+| `verify` | **one forward over every stream's window** (up to 16 windows, 128 rows): `pending`, the held drafts and any host drafts (a copy of earlier text the round loop found: up to `WINDOW` − 1 rows for a lone stream), each row drawn with its stream's `Sampling` at its own position (among the allowed tokens when the window carries a grammar's masks) |
 | `keep` | roll each stream back to its accepted prefix (`bolt_keep_seq`; a repeat is a no-op) |
-| `draft` | cuts each stream back to its kept rows first (a shared round drafts before it keeps), then LiLiCorr proposes seven tokens for every stream in **one pass over the drafter's weights** (one CUDA graph a stream count, `BOLT_DRAFT_GRAPH=0` launches eagerly); the first `depth` are held for the next window |
+| `draft` | cuts each stream back to its kept rows first (a shared round drafts before it keeps), then LiLiCorr proposes seven tokens for every stream in **one pass over the drafter's weights** (one CUDA graph a stream count, `BOLT_DRAFT_GRAPH=0` launches eagerly); the first `depth` are held for the next window. A sampled stream's seven are drawn with the stream's own keyed noise (below); a stream asked for no drafts (`depth` 0: a copy takes its next window) costs no proposal |
 | `release` | gives the sequence back and unmaps the attention memory it grew into |
 
 Draws use `lanes.sampling.choose` (Gumbel over the top candidates, `top_k` / `top_p` / `min_p`, keyed by seed and
 position), so a speculative run draws what a plain run would. libbolt returns the top 20 or 64 candidates a row
-(1 when greedy); `top_k` above 64 is capped. Facts reported to the round loop: window 8, drafts 7, window costs and
-shared-round costs measured at load (rows 2 to 128 over all sequences), the drafter's cost, `hidden_rows` and
-`draft_streams` on when there is more than one sequence, acceptance prior 0.80 falling to 0.68. Logprobs and
-trees are not served by this backend; the round loop is told so.
+(1 when greedy); `top_k` above 64 is capped. Facts reported to the round loop: window `WINDOW` (8, 16 or 32 rows, what
+`bolt_window` says the loaded model takes), drafts 7, a first copy window of 8 rows (a copy kept whole doubles the next,
+up to the window), window costs for every width and shared-round costs measured at load (rows 2 to 128 over all
+sequences), the drafter's cost, `hidden_rows` and `draft_streams` on when there is more than one sequence, acceptance
+prior 0.80 falling to 0.68; built against TensorFold 1.2 also `copy_first` (the proposal is a pass of its own, so a
+round a copy takes asks for no drafts). Logprobs, trees and presence or frequency penalties are not served by this
+backend; the round loop is told so.
+
+The backend source builds against TensorFold 1.1.6 (the pin) and 1.2.9 (`patches/tf-1.2.9`): the two differences it
+meets, `prefill_step`'s row-cap argument and `Model.copy_first`, are resolved at compile time from the lane core's own
+declarations.
 
 `--parallel N` sets how many streams run together; the backend hands N to libbolt as `BOLT_SEQS` (unless the environment
 sets it), which sizes the recurrent state. Extra jobs beyond N queue.
 
 ## libbolt (`engine/`)
 
-- `bolt_host.cu`: loading, the block forward, the C API (`bolt_abi` is its version, 3, which the backend checks at load;
+- `bolt_host.cu`: loading, the block forward, the C API (`bolt_abi` is its version, 4, which the backend checks at load;
+  `bolt_window` is the rows a verify window carries at most; `bolt_propose_draws` drafts with each stream's keyed draw;
   `bolt_keep_multi` cuts every stream of a round back in one call;
   `bolt_prefill_seq_rows` takes image rows by device pointer; `bolt_mask_rows` redraws rows under a grammar's masks), sequences, snapshots, calibration. A *block* is a list of
   segments, each a run of rows of one sequence (a prompt chunk is one segment; a shared decode round has one verify
@@ -58,12 +66,12 @@ sets it), which sizes the recurrent state. Extra jobs beyond N queue.
   (`mma_decode_rows`) use the K-split kernel at any row count, 64 tokens a CTA. Prompt attention and verify-window
   attention on bf16 mma with online softmax (`attn_mma2_part_k` for prompt chunks with the bf16 cache: `cp.async`
   staging and `ldmatrix` fragments, `BOLT_ATTN_V2=0` for the first kernel; `attn_mma_part_k` for windows, one CTA a
-  stream's window, and the fp8 cache). The prompt pass's NVFP4 projections run on the block-scaled fp4 MMA
+  query block of eight rows of a stream's window, and the fp8 cache). The prompt pass's NVFP4 projections run on the block-scaled fp4 MMA
   (`mma_nv4_fp4_k`, `BOLT_NV4_FP4`).
 - `bolt_kernels.cu`: norms, the Mamba conv and scan (a row-parallel conv and a thread-pair scan for long blocks, a
   warp-per-channel scan for windows), the router, the routed experts on int8 tensor cores, candidate selection.
 - `bolt_draft.cu`: the LiLiCorr drafter: five DFlash layers (grouped conv, sliding-window sink attention, NVFP4 MLP)
-  over the six captured residuals, then the candidate lattice and its greedy walk. A call drafts for up to 16 streams;
+  over the six captured residuals, then the candidate lattice and its walk. A call drafts for up to 16 streams;
   the kept rows of every stream are ingested in one pass too.
 
 ### Images and video
@@ -97,7 +105,7 @@ masked top-k with a CPU reference for a mask of 5 tokens, about half the vocabul
   writes its final state; `keep(n)` for a partial accept replays the first `n` rows from the pre-window copy
   (`k_scan_replay`, using the window's saved scan inputs). Rolling back to zero rows is a pointer flip.
   With `BOLT_SSM_LAZY=1` (`SSM_LAZY`) there is one copy: a verify window writes no state, the conv saves each row's scan
-  inputs in one of two per-sequence slots of eight rows, `keep(n)` records `n` (`Seq.pending`), and the sequence's next
+  inputs in one of two per-sequence slots of `WINDOW` rows, `keep(n)` records `n` (`Seq.pending`), and the sequence's next
   block folds those rows in at the start of its scan (`Ctl.seg_replay`, `seg_hist`), writes the state once and runs its
   own rows from it; a prompt chunk commits its final state as before, and a snapshot with rows pending folds them first
   (`k_scan_fold`). The default: measured on a Spark, replies are the same token for token and 4 to 16 streams decode 3 to 8 %
@@ -106,19 +114,52 @@ masked top-k with a CPU reference for a mask of 5 tokens, about half the vocabul
   MMA (`kind::mxf4nvf4`, m16n8k64, e4m3 scales a block of 16) with the rows quantized to NVFP4 first (`quant_nv4_rows_k`);
   the weights are read as stored, reordered into the MMA's fragment order at load (`tile_nv4w_k`, a second copy). Verify
   blocks keep the fp16 rows. Perplexity +0.8 % on `engine/tools/ppl.cu` for +17 to 20 % prefill; libbolt builds for `sm_121a`.
-- **Conv**: a ring of nine slots; a window writes the state after each row, `keep(n)` picks slot `n`.
+- **Conv**: a ring of `WINDOW` + 1 slots (nine at 8 rows, 33 at 32); a window writes the state after each row, `keep(n)`
+  picks slot `n`.
 - **Attention K/V**: bf16, 8 KB a token; with `BOLT_KV=fp8` (`KV_DTYPE=fp8`) e4m3 bytes plus an fp32 scale per token and
   head (amax / 448, set when the row is stored), 4.1 KB a token. The kernels dequantize while staging tiles, so the
   cache costs no speed. Upstream TensorFold has no Nemotron cache quantization (its int8/int4 `--kv-dtype` is Flash
   Next's) and the checkpoint ships no KV scales, hence the dynamic ones. Reserved at the full window for every sequence but mapped 4096 tokens at a
   time (CUDA virtual memory, 2 MiB granules) as the sequence grows, and unmapped down to one granule when it is
   released, so 16 streams can each have the 262,144-token window while memory follows use. If the driver cannot do
-  that, or `BOLT_KV_EAGER=1`, everything is allocated up front. `BOLT_KV_RESERVE_GIB` (default 3) is the free memory
-  a growing stream leaves alone; past it the forward fails instead of freezing the machine.
+  that, or `BOLT_KV_EAGER=1`, everything is allocated up front. `BOLT_KV_RESERVE_GIB` (default 3) is the memory
+  a growing stream leaves alone; past it the forward fails instead of freezing the machine. What counts is the larger
+  of the driver's free memory and `/proc/meminfo`'s `MemAvailable` (`kv_room`): where the GPU's memory is the system's,
+  the driver reports free pages only, and those run low whenever the page cache is full although the kernel would
+  give that memory up.
 - **Drafter**: a 2048-entry K/V ring per layer and the anchor row; prompt rows older than 1,100 never reach it.
 
-Memory a sequence holds from load: 0.41 GiB (two SSM copies over 40 layers, the conv ring) plus the drafter's 21 MB;
-0.28 GiB with one copy (`SSM_LAZY=1`, which adds 27 MB of saved scan inputs).
+Memory a sequence holds from load at `WINDOW=8`: 0.41 GiB (two SSM copies over 40 layers, the conv ring) plus the
+drafter's 21 MB; 0.28 GiB with one copy (`SSM_LAZY=1`, which adds 27 MB of saved scan inputs). The conv ring (4.7 MiB a
+slot over the 40 layers) and the saved scan inputs (two slots of `WINDOW` rows, 1.6 MiB a row) grow with the window: with
+one copy a sequence holds 0.33 GiB at `WINDOW=16` and 0.46 GiB at 32, the recipe's default.
+
+### Drafts for a sampled stream
+
+TensorFold draws a sampled row as the token with the largest `logit / temperature + noise` in the row's nucleus, where
+the noise is Gumbel noise keyed by the request's seed, the row's position and the token (`lanes/sampling.zig`): the
+same request draws the same tokens whatever the windows were. A draft is kept when it is the token its row draws, so
+the walk through LiLiCorr's lattice draws too (`walk_k`, `BOLT_DRAFT_COUPLE`, default 1): at each slot it takes the
+candidate with the largest `8 · cosine / temperature + w · noise`, the lattice's edge logit (the checkpoint's
+`lilicorr_logit_scale` is 8) and the same keyed noise at the position that slot's row will be drawn at, among the
+candidates the target's `top_p` would keep by the lattice's own probabilities. With the same noise on both sides, the
+draft follows the target to its second or third choice where the drafter's best guess would have missed. `w`
+(`BOLT_DRAFT_NOISE`, default 0.5) is less than 1 because the lattice is less sure of a candidate than the target is of
+its token; `BOLT_DRAFT_COUPLE=0` walks greedily for every stream, as before, and a greedy stream (temperature 0, or
+`top_k` 1) always does. Drafts are only ever proposals: the target draws every row itself, so this changes how many
+rounds a reply takes, never its tokens. Measured in the changelog.
+
+### Wider windows for copies
+
+The round loop finds text a reply is repeating (a suffix of eight or more tokens that occurred before, in the prompt or
+the reply) and puts the continuation into the stream's next window as host drafts; a copy that lands whole doubles the
+next one. The widest window is `WINDOW` rows (`BOLT_WINDOW`, set at load: 8, 16 or 32), so with 32 a rewrite verifies
+31 copied tokens in one forward of about 56 ms instead of seven in 32 ms. A window wider than eight rows is the same
+kernels over more rows: the GEMMs already sum in an order that does not depend on the row count, the conv ring and the
+saved scan inputs have a slot a row, and the window's attention runs in query blocks of eight rows, one CTA each
+(`Ctl.qb_seg`, `qb_off`), with the key chunks every window of the sequence uses (`win_chunk`; a window that starts
+within its width of the 32nd chunk's end launches a 33rd). A window of up to eight rows is one block and runs exactly
+as it did.
 
 ### Why a round costs what it does
 

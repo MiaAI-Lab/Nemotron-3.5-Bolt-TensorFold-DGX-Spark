@@ -49,7 +49,10 @@ zig-out\native\bin\tensorfold-native.exe serve "<HF_HOME>\hub\models--nvidia--NV
     --name Nemotron-3.5-Bolt --host 127.0.0.1 --port 8080 --parallel 4 --context 131072 --prompt-cache-gib 4
 ```
 
-These are `scripts/config.sh`'s defaults with a smaller `PARALLEL`, `CONTEXT` and `PROMPT_CACHE_GIB`. `start.sh` and its
+These are `scripts/config.sh`'s defaults with a smaller `PARALLEL`, `CONTEXT` and `PROMPT_CACHE_GIB`, and without
+`WINDOW=32` (the recipe's default since 2026-11-16: `$env:BOLT_WINDOW = '32'`; unset, libbolt verifies windows of 8
+rows as it did when this page was checked; the wider window and the two exports it came with, `bolt_window` and
+`bolt_propose_draws` in `engine/bolt.def`, were built and measured on Linux only). `start.sh` and its
 `MemAvailable` checks are not used here; on this machine the GPU has its own reserved pool. Loading took 66 seconds.
 With these settings the GPU held 33.2 GB, the display's share included.
 

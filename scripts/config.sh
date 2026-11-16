@@ -27,8 +27,16 @@ DRAFT_REVISION="${DRAFT_REVISION:-4c6a5613b6d887194a3a5493e3a18a5b3930bb86}"
 # TensorFold v1.1.6 (2026-10-26: shared-prefix prompts wait for each other, cancelled prompts keep their prefill, the
 # keyed-race sampler, the lane host's prompt and burst scheduling). patches/0002 registers the libbolt Bolt family; the
 # image-token cap it used to lift is upstream's since 1.1.3. Zig ZIG_VERSION builds the native CUDA server.
+# The engine also builds against v1.2.9 (2026-11-14), whose registration patch is in patches/tf-1.2.9:
+#   TF_REF=6b9de695104b6b8b30c20458da87ac06c9480289 TF_PATCHES=patches/tf-1.2.9 ./start.sh
+# Measured on a Spark (CHANGELOG, 2026-11-16): the same decode speed, copy rounds that skip the drafter's pass, and
+# upstream's newer prompt cache and fixes; but a request that sets presence_penalty or frequency_penalty is refused
+# (1.1.6 served it without them), and when concurrent new prompts want more prompt cache than PROMPT_CACHE_GIB holds, a
+# reply can differ from the same request run alone (a prompt is then prefilled in one piece instead of two, which rounds
+# differently). That is why 1.1.6 stays the default.
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 TF_REF="${TF_REF:-eea9dc9c9c8b459c0a03de7f6fe0c6f4835d69ab}"
+TF_PATCHES="${TF_PATCHES:-patches}"
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
@@ -36,7 +44,7 @@ TF_TAG="zig-${TF_REF:0:7}"
 IMAGE="${IMAGE:-tensorfold-nemotron-bolt:${TF_TAG}}"
 image_hash() {
   ( cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
-    cat patches/*.patch engine/*.cu engine/*.h engine/*.inc engine/*.zig 2>/dev/null
+    cat "$TF_PATCHES"/*.patch engine/*.cu engine/*.h engine/*.inc engine/*.zig 2>/dev/null
     sed -n "/<<'DOCKERFILE'/,/^DOCKERFILE\$/p" scripts/prepare.sh
     echo "$TF_REPO $TF_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE nemotron-bolt"
   ) | sha256sum | cut -c1-12
@@ -76,6 +84,12 @@ KV_PIN="${KV_PIN:-0}"
 # stream holds 0.28 GiB from load instead of 0.41. Measured on a Spark: the same replies token for token, 3 to 8% more
 # tokens a second at 4 to 16 streams, no change alone (BOLT_SSM_LAZY). 0 is the two-copy path.
 SSM_LAZY="${SSM_LAZY:-1}"
+# Rows a verify window carries at most: 8, 16 or 32 (BOLT_WINDOW). The drafter proposes seven tokens, so 8 rows hold every
+# drafted window. When a reply repeats earlier text (an edited file, a rewritten paragraph, quoted input) TensorFold drafts
+# the copy itself and doubles its length each time one lands whole, and a wider window verifies it in one forward: measured
+# on a Spark, a file rewrite decodes at 207 tok/s with 8 rows and 320 to 340 with 32, the same tokens. A stream holds 0.28
+# GiB of state from load at 8, 0.33 at 16, 0.46 at 32 (the conv ring and the saved scan inputs grow with the window).
+WINDOW="${WINDOW:-32}"
 # 1 stores the LiLiCorr drafter's attention and kernel projections as Q8_0 (half the bytes a proposal reads); the target
 # checks every draft, so this changes what is proposed, never the reply. 0 keeps them bf16 (BOLT_DRAFT_Q8). Measured: the
 # same replies and the same speed within noise either way; Q8_0 keeps 200 MB of memory.
@@ -125,6 +139,7 @@ mem_need_gib() {
   local ctx=${1:-$CONTEXT} vis=0 per=45
   [[ "$VISION" == 1 ]] && vis=3
   [[ "$SSM_LAZY" == 1 ]] && per=30   # hundredths of a GiB a stream holds from load
+  [[ "$WINDOW" == 16 ]] && per=$((per + 5)); [[ "$WINDOW" == 32 ]] && per=$((per + 18))
   (( ctx > 65536 )) && ctx=65536
   if [[ "$KV_PIN" == 1 ]]; then ctx=${1:-$CONTEXT}; echo $(( vis + CKPT_GIB + (PARALLEL * per + 99) / 100 + PARALLEL * $(kv_gib "$ctx") + MEM_FLOOR_GIB + 2 + PROMPT_CACHE_GIB )); return; fi
   echo $(( vis + CKPT_GIB + (PARALLEL * per + 99) / 100 + $(kv_gib "$ctx") + MEM_FLOOR_GIB + 2 + PROMPT_CACHE_GIB ))

@@ -29,6 +29,7 @@ EXPORTS
     bolt_prof_report
     bolt_prompt_end
     bolt_propose
+    bolt_propose_draws
     bolt_propose_multi
     bolt_propose_seq
     bolt_push
@@ -46,3 +47,4 @@ EXPORTS
     bolt_snap_restore_seq
     bolt_snap_save
     bolt_snap_save_seq
+    bolt_window
