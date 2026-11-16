@@ -1154,11 +1154,12 @@ __global__ void conv_k(const Ctl* __restrict__ ctl, float* __restrict__ pool,
     if (sg >= ctl->nseg) return;
     const int r0 = ctl->seg_row0[sg], r1 = ctl->seg_row0[sg + 1];
     if (hist_x && lazy) {   // the sequence's own rows, in the slot its next block does not fold from
-        const size_t base = ((size_t)ctl->seg_seq[sg] * 2 + (ctl->seg_hist[sg] ^ 1)) * VERIFY_MAX;
+        const size_t base = ((size_t)ctl->seg_seq[sg] * 2 + (ctl->seg_hist[sg] ^ 1)) * ctl->win;
         hist_x += (ptrdiff_t)base * HIST_ROW - (ptrdiff_t)r0 * HIST_ROW;
         hist_dt += (ptrdiff_t)base * 128 - (ptrdiff_t)r0 * 128;
     }
-    float* ring = pool + (size_t)ctl->seg_seq[sg] * CONV_SLOTS * CONV_ELEMS;
+    const int slots = ctl->win + 1;
+    float* ring = pool + (size_t)ctl->seg_seq[sg] * slots * CONV_ELEMS;
     const int cur = ctl->seg_conv[sg];
     const float* in = ring + (size_t)cur * CONV_ELEMS + (size_t)c * 3;
     float s0 = in[0], s1 = in[1], s2 = in[2];
@@ -1174,12 +1175,12 @@ __global__ void conv_k(const Ctl* __restrict__ ctl, float* __restrict__ pool,
         }
         s0 = s1; s1 = s2; s2 = xin;
         if (record) {
-            float* o = ring + (size_t)((cur + 1 + (t - r0)) % CONV_SLOTS) * CONV_ELEMS + (size_t)c * 3;
+            float* o = ring + (size_t)((cur + 1 + (t - r0)) % slots) * CONV_ELEMS + (size_t)c * 3;
             o[0] = s0; o[1] = s1; o[2] = s2;
         }
     }
     if (!record) {
-        float* o = ring + (size_t)((cur + 1) % CONV_SLOTS) * CONV_ELEMS + (size_t)c * 3;
+        float* o = ring + (size_t)((cur + 1) % slots) * CONV_ELEMS + (size_t)c * 3;
         o[0] = s0; o[1] = s1; o[2] = s2;
     }
     pdl_trigger();
@@ -1192,7 +1193,8 @@ __global__ void conv_long_k(const Ctl* __restrict__ ctl, float* __restrict__ poo
     pdl_wait();
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= 10240) return;
-    float* ring = pool + (size_t)ctl->seg_seq[0] * CONV_SLOTS * CONV_ELEMS;
+    const int slots = ctl->win + 1;
+    float* ring = pool + (size_t)ctl->seg_seq[0] * slots * CONV_ELEMS;
     const int cur = ctl->seg_conv[0];
     const float* in = ring + (size_t)cur * CONV_ELEMS + (size_t)c * 3;
     const int t0 = blockIdx.y * CONV_ROWS, t1 = min(T, t0 + CONV_ROWS);
@@ -1220,7 +1222,7 @@ __global__ void conv_long_k(const Ctl* __restrict__ ctl, float* __restrict__ poo
         s0 = s1; s1 = s2; s2 = xin[j];
     }
     if (t1 == T) {   // the block holding the last row writes the new state: inputs T-3 .. T-1
-        float* o = ring + (size_t)((cur + 1) % CONV_SLOTS) * CONV_ELEMS + (size_t)c * 3;
+        float* o = ring + (size_t)((cur + 1) % slots) * CONV_ELEMS + (size_t)c * 3;
 #pragma unroll
         for (int j = 0; j < 3; j++) {
             int t = T - 3 + j;
@@ -1265,7 +1267,7 @@ __global__ void __launch_bounds__(256) scan_k(const Ctl* __restrict__ ctl, float
         // the kept rows of the sequence's last window, from the inputs its conv saved: the state after them is committed
         const int nrep = ctl->seg_replay[sg];
         if (nrep > 0) {
-            const size_t base = ((size_t)ctl->seg_seq[sg] * 2 + ctl->seg_hist[sg]) * VERIFY_MAX;
+            const size_t base = ((size_t)ctl->seg_seq[sg] * 2 + ctl->seg_hist[sg]) * ctl->win;
             for (int r = 0; r < nrep; r++) {
                 float v = hist_dt[(base + r) * 128 + h] + bias;
                 float sp = v > 20.f ? v : log1pf(__expf(v));
@@ -1330,7 +1332,7 @@ __global__ void __launch_bounds__(128) scan_t_k(const Ctl* __restrict__ ctl, flo
     const float Dh = Dp[h];
     if (lazy) {   // pending rows of the sequence's last window (none after a prompt piece; kept for a block after a window)
         const int nrep = ctl->seg_replay[0];
-        const size_t base = ((size_t)ctl->seg_seq[0] * 2 + ctl->seg_hist[0]) * VERIFY_MAX;
+        const size_t base = ((size_t)ctl->seg_seq[0] * 2 + ctl->seg_hist[0]) * ctl->win;
         for (int r = 0; r < nrep; r++) {
             float v = hist_dt[(base + r) * 128 + h] + bias;
             float sp = v > 20.f ? v : log1pf(__expf(v));
@@ -1430,7 +1432,7 @@ __global__ void __launch_bounds__(256, 1) scan_ssd_k(const Ctl* __restrict__ ctl
     __syncthreads();
     if (lazy) {   // pending rows of the sequence's last window first, as scan_t_k does
         const int nrep = ctl->seg_replay[0];
-        const size_t base = ((size_t)ctl->seg_seq[0] * 2 + ctl->seg_hist[0]) * VERIFY_MAX;
+        const size_t base = ((size_t)ctl->seg_seq[0] * 2 + ctl->seg_hist[0]) * ctl->win;
         for (int r = 0; r < nrep; r++) {
             const float v = hist_dt[(base + r) * 128 + h] + bias;
             const float sp = v > 20.f ? v : log1pf(__expf(v));
@@ -2205,7 +2207,7 @@ void k_scan_replay(cudaStream_t s, const ReplayLayer* layers, int nlayers, int s
 
 // Lazy state: the first n saved rows of hist slot hslot of the sequence, folded into its one state slot in place (each
 // warp reads and writes its own entries alone).
-__global__ void __launch_bounds__(256) scan_fold_k(const ReplayLayer* __restrict__ layers, int seq, int hslot, int n) {
+__global__ void __launch_bounds__(256) scan_fold_k(const ReplayLayer* __restrict__ layers, int seq, int hslot, int n, int win) {
     pdl_wait();
     const ReplayLayer L = layers[blockIdx.y];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -2217,7 +2219,7 @@ __global__ void __launch_bounds__(256) scan_fold_k(const ReplayLayer* __restrict
     float4 st = *reinterpret_cast<const float4*>(st_p);
     const float A = -__expf(L.A_log[h]);
     const float bias = L.dt_bias[h];
-    const size_t base = ((size_t)seq * 2 + hslot) * VERIFY_MAX;
+    const size_t base = ((size_t)seq * 2 + hslot) * win;
     for (int r = 0; r < n; r++) {
         float v = L.hist_dt[(base + r) * 128 + h] + bias;
         float sp = v > 20.f ? v : log1pf(__expf(v));
@@ -2233,6 +2235,6 @@ __global__ void __launch_bounds__(256) scan_fold_k(const ReplayLayer* __restrict
     *reinterpret_cast<float4*>(st_p) = st;
     pdl_trigger();
 }
-void k_scan_fold(cudaStream_t s, const ReplayLayer* layers, int nlayers, int seq, int hslot, int n) {
-    if (n > 0) launch_pdl(scan_fold_k, dim3(128 * 8, nlayers), 256, 0, s, layers, seq, hslot, n);
+void k_scan_fold(cudaStream_t s, const ReplayLayer* layers, int nlayers, int seq, int hslot, int n, int win) {
+    if (n > 0) launch_pdl(scan_fold_k, dim3(128 * 8, nlayers), 256, 0, s, layers, seq, hslot, n, win);
 }

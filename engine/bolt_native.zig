@@ -22,8 +22,11 @@ pub const snap_lookahead: u32 = 0;
 
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, lanes: u32 = 1 };
 
-/// Rows a verify window carries at most: the pending token and seven drafts.
-const window: u32 = 8;
+/// Rows a drafted window carries: the pending token and LiLiCorr's seven drafts.
+const draft_rows: u32 = 8;
+/// Rows a verify window carries at most (`bolt_window` says what the loaded model takes, BOLT_WINDOW: 8, or 16 or 32 so
+/// a copy of earlier text is verified in a longer window).
+const max_window: u32 = 32;
 /// Prompt rows a cancel waits for at most, and the smaller piece while other streams decode.
 const piece_rows: usize = 2048;
 const busy_piece_rows: usize = 512;
@@ -58,7 +61,7 @@ const Slot = struct {
     ids: []c_int = &.{}, // the prompt, while its pass runs
     at: usize = 0, // prompt tokens done
     decoding: bool = false, // the prompt pass is over
-    held: [window]u32 = @splat(0), // the drafts held for the stream's next window
+    held: [draft_rows]u32 = @splat(0), // the drafts held for the stream's next window
     held_n: u32 = 0,
 };
 
@@ -71,6 +74,7 @@ const Engine = struct {
     model: *anyopaque,
     drafts: bool,
     seqs: u32,
+    window: u32 = draft_rows, // rows a verify window carries at most (bolt_window)
     slots: std.AutoHashMapUnmanaged(*const lanes.Stream, *Slot) = .empty,
     ring: [draw_ring]u32 = @splat(0),
     drawn: u64 = 0,
@@ -147,14 +151,26 @@ const Engine = struct {
         return slot;
     }
 
-    /// One piece of the prompt pass, cut at the cache's marks, small enough that a cancel lands quickly.
+    /// `prefill_step` as TensorFold 1.2 calls it: `max_rows` is the host's cap for a piece beside live decoders (0: none;
+    /// it caps only a family that declares chunk_invariant, which this one does not).
+    fn prefillStepCapped(ptr: *anyopaque, s: *lanes.Stream, max_rows: u32) !bool {
+        return prefillRows(ptr, s, max_rows);
+    }
+
+    /// `prefill_step` as TensorFold 1.1 calls it.
     fn prefillStep(ptr: *anyopaque, s: *lanes.Stream) !bool {
+        return prefillRows(ptr, s, 0);
+    }
+
+    /// One piece of the prompt pass, cut at the cache's marks, small enough that a cancel lands quickly.
+    fn prefillRows(ptr: *anyopaque, s: *lanes.Stream, max_rows: u32) !bool {
         const e: *Engine = @ptrCast(@alignCast(ptr));
         const prompt_len = s.prompt().len;
         const slot = e.slots.get(s) orelse try e.begin(s);
         if (s.isCancelled() or s.yields()) return error.Cancelled;
         if (slot.at >= prompt_len) return true;
-        const rows: usize = if (e.decoding > 0) busy_piece_rows else piece_rows;
+        var rows: usize = if (e.decoding > 0) busy_piece_rows else piece_rows;
+        if (max_rows != 0) rows = @min(rows, max_rows);
         var end = @min(prompt_len, slot.at + rows);
         for (s.reuse.marks) |m| {
             if (m > slot.at and m < end) end = m;
@@ -206,7 +222,7 @@ const Engine = struct {
     }
 
     fn prefill(ptr: *anyopaque, s: *lanes.Stream) !void {
-        while (!try prefillStep(ptr, s)) {}
+        while (!try prefillRows(ptr, s, 0)) {}
     }
 
     /// A cancelled prompt pass keeps the prefix it had done: the cache's hook saves the sequence's state at that row
@@ -279,7 +295,7 @@ const Engine = struct {
         for (windows, 0..) |w, i| {
             const slot = try e.slotOf(w.stream);
             const rows = w.rows();
-            if (rows > window or w.parents != null or total + rows > max_batch) return error.WindowTooWide;
+            if (rows > e.window or w.held >= draft_rows or w.parents != null or total + rows > max_batch) return error.WindowTooWide;
             if (w.masks.len != 0) {
                 const words = w.masks.len / rows;
                 if (words == 0 or words * rows != w.masks.len or (mwords != 0 and words != mwords)) return error.BadMask;
@@ -363,6 +379,7 @@ const Engine = struct {
         var anchors: [max_segs]c_int = undefined;
         var who: [max_segs]*Slot = undefined;
         var depths: [max_segs]u32 = undefined;
+        var draws: [max_segs]lib.Draw = undefined;
         var n: usize = 0;
         // a shared round drafts before it keeps: cut every stream back to its kept rows first (a repeat is a no-op)
         var cuts: Cuts = .{};
@@ -383,17 +400,19 @@ const Engine = struct {
             anchors[n] = @intCast(pending);
             who[n] = slot;
             depths[n] = r.depth;
+            // a sampled stream's drafts are drawn as its target rows will be: the same seed, each draft at its row's position
+            draws[n] = if (r.stream.sampling) |sm| .{ .seed = sm.seed, .position = r.position, .temperature = if (sm.top_k == 1) 0 else @floatCast(@max(sm.temperature, 0)), .top_p = @floatCast(sm.top_p) } else .{};
             n += 1;
         }
         if (n == 0) return;
-        var out: [max_segs * window]c_int = @splat(0);
+        var out: [max_segs * draft_rows]c_int = @splat(0);
         var got: [max_segs]c_int = @splat(0);
-        e.api.propose_multi(e.model, @intCast(n), &seqs, &anchors, &out, &got);
+        e.api.propose_draws(e.model, @intCast(n), &seqs, &anchors, &draws, &out, &got);
         for (0..n) |i| {
-            const depth: usize = @min(@as(usize, depths[i]), window - 1);
+            const depth: usize = @min(@as(usize, depths[i]), draft_rows - 1);
             const have: usize = @intCast(@max(0, got[i]));
             const pending: u32 = @intCast(anchors[i]);
-            for (0..depth) |j| who[i].held[j] = if (j < have) @intCast(out[i * window + j]) else pending;
+            for (0..depth) |j| who[i].held[j] = if (j < have) @intCast(out[i * draft_rows + j]) else pending;
             who[i].held_n = @intCast(depth);
         }
     }
@@ -412,7 +431,7 @@ const Engine = struct {
         const vt = struct {
             var v: lanes.backend.Backend.VTable = .{
                 .prefill = Engine.prefill,
-                .prefill_step = Engine.prefillStep,
+                .prefill_step = if (step_capped) Engine.prefillStepCapped else Engine.prefillStep,
                 .cancel_prefill = Engine.cancelPrefill,
                 .first = Engine.first,
                 .first_masked = Engine.firstMasked,
@@ -483,8 +502,11 @@ pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
 }
 
 /// What the loaded libbolt measured: forward ms by window width, and shared forwards by total rows.
-var costs: [window]lanes.config.Cost = undefined;
+var costs: [max_window]lanes.config.Cost = undefined;
 var shared: [32]lanes.config.Cost = undefined;
+/// TensorFold 1.2 hands `prefill_step` the host's row cap for a piece (two arguments before it), and its round loop can
+/// ask a stream for no drafts when a copy takes its next window (`Model.copy_first`). The backend builds against both.
+const step_capped = @FieldType(lanes.backend.Backend.VTable, "prefill_step") == ?*const fn (*anyopaque, *lanes.Stream, u32) anyerror!bool;
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     _ = kernels;
@@ -524,6 +546,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const e = try gpa.create(Engine);
     const nseq: u32 = @intCast(@max(1, api.seqs(model)));
     e.* = .{ .gpa = gpa, .api = api, .model = model, .drafts = o.drafts and api.has_draft(model) != 0, .seqs = nseq, .stat_on = sys.getenv("BOLT_STATS") != null, .vision = tower, .stream = stream };
+    const window: u32 = @intCast(@max(1, @min(api.window(model), @as(c_int, max_window))));
+    e.window = window;
     for (0..window) |i| costs[i] = .{ .width = @intCast(i + 1), .ms = api.cost(model, @intCast(i + 1)) };
     const propose_ms = api.cost(model, 0);
     const propose_multi_ms = api.draft_multi_cost(model);
@@ -533,28 +557,34 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     for (0..n_shared) |i| shared[i] = .{ .width = @intCast(rows_buf[i]), .ms = ms_buf[i] };
     std.log.info("bolt: windows ms {d:.1} {d:.1} {d:.1} {d:.1} {d:.1} {d:.1} {d:.1} {d:.1}, one proposal {d:.1} ({d} streams {d:.1}), drafts {s}, {d} sequence{s}", .{ costs[0].ms, costs[1].ms, costs[2].ms, costs[3].ms, costs[4].ms, costs[5].ms, costs[6].ms, costs[7].ms, propose_ms, nseq, propose_multi_ms, if (e.drafts) "on" else "off", nseq, if (nseq == 1) "" else "s" });
     for (shared[0..n_shared]) |c| std.log.info("bolt: shared round of {d} rows {d:.1} ms", .{ c.width, c.ms });
+    var facts: lanes.Model = .{
+        .exact_width = window,
+        // a copy's first window is a drafted window's width; each copy kept whole doubles the next, up to `window`
+        .first_copy_rows = draft_rows,
+        .gpu_tokens = false,
+        .mtp = e.drafts,
+        .speculate = e.drafts,
+        .speculate_early = false,
+        .draft_prior = &prior,
+        .drafts = draft_rows - 1,
+        .window_costs = costs[0..window],
+        .shared_costs = shared[0..n_shared],
+        // LiLiCorr proposes its seven drafts in one pass whatever depth a window takes, so a draft level costs
+        // nothing by itself: the pass is a flat cost a round, which the round loop measures as overhead (per
+        // stream count, so a wider batch's longer pass is priced too)
+        .mtp_step_ms = 0,
+        .draft_streams = nseq > 1,
+        .hidden_rows = nseq > 1,
+        .streams_exact = true,
+        .batch_rows = @min(max_batch, nseq * window),
+        .max_streams = nseq,
+    };
+    // the proposal is a pass of its own (about 6 ms a round), so a stream whose next window a copy of earlier text
+    // takes is asked for no drafts instead of one the window would not use (TensorFold 1.2's round loop)
+    if (@hasField(lanes.Model, "copy_first")) @field(facts, "copy_first") = true;
     return .{
         .backend = e.backend(),
-        .facts = .{
-            .exact_width = window,
-            .gpu_tokens = false,
-            .mtp = e.drafts,
-            .speculate = e.drafts,
-            .speculate_early = false,
-            .draft_prior = &prior,
-            .drafts = window - 1,
-            .window_costs = &costs,
-            .shared_costs = shared[0..n_shared],
-            // LiLiCorr proposes its seven drafts in one pass whatever depth a window takes, so a draft level costs
-            // nothing by itself: the pass is a flat cost a round, which the round loop measures as overhead (per
-            // stream count, so a wider batch's longer pass is priced too)
-            .mtp_step_ms = 0,
-            .draft_streams = nseq > 1,
-            .hidden_rows = nseq > 1,
-            .streams_exact = true,
-            .batch_rows = @min(max_batch, nseq * window),
-            .max_streams = nseq,
-        },
+        .facts = facts,
         .rows = window,
         .stream_bytes = @intCast(api.seq_bytes(model)),
         .free_streams = nseq, // their state is already resident
@@ -571,7 +601,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BoltForward => "Bolt's forward failed",
         error.VisionRefused => "--vision: this checkpoint has no image tower Bolt reads (the RADIO tower of an omni checkpoint); serve it without --vision",
         error.NoVision => "this server reads no images: start it with --vision",
-        error.WindowTooWide => "Bolt verifies chains of up to eight rows a stream, sixteen streams at a time",
+        error.WindowTooWide => "Bolt verifies chains of up to its window's rows a stream (BOLT_WINDOW: 8, 16 or 32; seven of them drafts), sixteen streams at a time",
         error.BadMask => "a grammar mask does not match the rows of its window",
         else => null,
     };

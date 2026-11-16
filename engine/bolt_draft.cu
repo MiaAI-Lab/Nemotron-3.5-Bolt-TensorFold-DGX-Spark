@@ -23,6 +23,7 @@ constexpr int BLOCK = 8, SLOTS = 7, TOPK = 8, MASK = 990, NODES = SLOTS * TOPK;
 constexpr int LH = 1024, LHEADS = 8, LDIM = 128;
 constexpr int DL = 5, RING = 2048, WINDOW = 1024;
 constexpr float EPS = 1e-6f, ROPE = 10000.f, VEPS = 1e-4f;
+constexpr float LSCALE = 8.f;   // the checkpoint's lilicorr_logit_scale: an edge's logit is LSCALE * cosine
 
 struct Info { std::string dtype; std::vector<long> shape; size_t off = 0, len = 0; };
 
@@ -258,6 +259,8 @@ struct Draft {
     int* out_host = nullptr;   // [nb][SLOTS]
     // the call's anchor rows, gathered on the device from a pinned pointer table (a graph holds no changing addresses)
     const float** ancp = nullptr; const float** ancp_h = nullptr;   // [nb]
+    // each stream's keyed draw (seed, the first draft's position, temperature, top_p); temperature 0 walks greedily
+    BoltDraw *draw_d = nullptr, *draw_h = nullptr;                  // [nb]
     // BOLT_DRAFT_GRAPH (default on): the proposal's launches for B streams, captured once and replayed as one graph
     std::unordered_map<int, cudaGraphExec_t> graphs;
     bool graph_off = false;   // a capture failed: propose eagerly from then on
@@ -661,14 +664,36 @@ __global__ void l2norm_k(float* x, float eps) {
     for (int i = threadIdx.x; i < LH; i += blockDim.x) r[i] *= inv;
 }
 
-// Greedy walk through the lattice: slot 0 from the anchor, then each slot from the previous choice.
+// The lane core's keyed draw (lanes/sampling.zig): splitmix64 of (seed, position, token), a uniform in (0, 1] from its
+// top 53 bits, Gumbel noise from that. A sampled stream's target row is drawn as the argmax of logit / T + noise over
+// its nucleus, so a draft drawn the same way from the drafter's own logits lands on the same token far more often than
+// the drafter's best guess does: the noise is shared, only the logits differ.
+__device__ __forceinline__ uint64_t key_mix(uint64_t x) {
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27; x *= 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+__device__ __forceinline__ double key_gumbel(uint64_t seed, uint64_t position, uint64_t id) {
+    const uint64_t base = key_mix(key_mix(seed + 0x9E3779B97F4A7C15ull) ^ (position * 0xD1B54A32D192ED03ull));
+    const double u = (double)(key_mix(base ^ id) >> 11) * 0x1p-53 + 0x1p-54;
+    return -log(-log(u));
+}
+
+// Walk through the lattice: slot 0 from the anchor, then each slot from the previous choice. A greedy stream (and
+// every stream with BOLT_DRAFT_COUPLE=0) takes the best edge at each slot. A sampled stream draws each slot with the
+// target's own keyed noise at that slot's position (`mode` 1: over the lattice's edge logits, LSCALE * cosine, which
+// are the head's conditional distribution among the slot's eight candidates; 2: over the backbone's own
+// log-probabilities, no lattice; 3: the mean of the two), within the nucleus the target's top_p would keep.
 // BOLT_DRAFT_TOP1=1 takes rank 0 at every slot (plain DFlash) instead of the lattice's choice, to measure what the lattice adds
-__global__ void walk_k(const float* anchor_out_all, const float* outv_all, const float* inv_all, const int* ids_all, int* result_all, int top1) {
+__global__ void walk_k(const float* anchor_out_all, const float* outv_all, const float* inv_all, const int* ids_all, int* result_all, int top1,
+                       const float* vals_all, const float* lse_all, const BoltDraw* draws, int mode, float noise) {
     const int b = blockIdx.x;
     const float* anchor_out = anchor_out_all + (size_t)b * LH;
     const float* outv = outv_all + (size_t)b * NODES * LH;
     const float* inv = inv_all + (size_t)b * NODES * LH;
     const int* ids = ids_all + (size_t)(b * BLOCK + 1) * CAND;
+    const float* vals = vals_all + (size_t)(b * BLOCK + 1) * CAND;
+    const float* lse = lse_all + b * BLOCK + 1;
     int* result = result_all + b * SLOTS;
     __shared__ float sc[TOPK];
     __shared__ int prev;
@@ -684,8 +709,52 @@ __global__ void walk_k(const float* anchor_out_all, const float* outv_all, const
         if (lane == 0) sc[warp] = acc;
         __syncthreads();
         if (threadIdx.x == 0) {
+            const int slot = s + 1;
+            const BoltDraw dw = draws[blockIdx.x];
             int best = 0;
-            if (!top1) for (int k = 1; k < TOPK; k++) if (sc[k] > sc[best]) best = k;
+            if (top1) {
+            } else if (mode == 0 || !(dw.temperature > 0.f)) {
+                for (int k = 1; k < TOPK; k++) if (sc[k] > sc[best]) best = k;
+            } else {
+                const float invt = 1.f / fmaxf(dw.temperature, 1e-6f);
+                float lg[TOPK], pr[TOPK];
+                int ord[TOPK];
+                float mass = 0.f, top = -1e30f;
+                for (int k = 0; k < TOPK; k++) {
+                    const float lp = vals[slot * CAND + k] - lse[slot];
+                    mass += __expf(lp);  // what the eight hold of the vocabulary, by the backbone
+                    const float edge = LSCALE * sc[k];
+                    lg[k] = (mode == 1 ? edge : mode == 2 ? lp : 0.5f * (edge + lp)) * invt;
+                    top = fmaxf(top, lg[k]);
+                    ord[k] = k;
+                }
+                float den = 0.f;
+                for (int k = 0; k < TOPK; k++) { pr[k] = __expf(lg[k] - top); den += pr[k]; }
+                // by logit, the lower rank first at a tie
+                for (int i = 1; i < TOPK; i++) {
+                    const int o = ord[i];
+                    int j = i - 1;
+                    for (; j >= 0 && lg[ord[j]] < lg[o]; j--) ord[j + 1] = ord[j];
+                    ord[j + 1] = o;
+                }
+                // the nucleus as lanes.sampling.chooseOrdered keeps it: every candidate before the mass reaches top_p, and the one that takes it there
+                int keep = TOPK;
+                if (dw.top_p > 0.f && dw.top_p < 1.f) {
+                    float cum = 0.f;
+                    int below = 0;
+                    for (int j = 0; j < TOPK; j++) {
+                        cum += pr[ord[j]] / den * fminf(mass, 1.f);
+                        if (cum < dw.top_p) below++;
+                    }
+                    keep = below + 1 < TOPK ? below + 1 : TOPK;
+                }
+                double lead = 0.;
+                for (int j = 0; j < keep; j++) {
+                    const int k = ord[j];
+                    const double score = (double)lg[k] + (double)noise * key_gumbel(dw.seed, dw.position + (uint64_t)slot, (uint64_t)ids[slot * CAND + k]);
+                    if (j == 0 || score > lead) { lead = score; best = k; }
+                }
+            }
             prev = best;
             result[s + 1] = ids[(s + 1) * CAND + best];
         }
@@ -910,6 +979,8 @@ Draft* draft_open(const char* dir, const uint16_t* embed, const TQ8& head, int n
     CK(cudaMallocHost(&d->cvp_h, DL * NB * sizeof(void*)));
     CK(cudaMallocHost(&d->clen_h, NB * 4)); CK(cudaMallocHost(&d->pos_h, NB * 4)); CK(cudaMallocHost(&d->anc_h_tok, NB * 4));
     CK(cudaMalloc(&d->ancp, NB * sizeof(void*))); CK(cudaMallocHost(&d->ancp_h, NB * sizeof(void*)));
+    CK(cudaMalloc(&d->draw_d, NB * sizeof(BoltDraw))); CK(cudaMallocHost(&d->draw_h, NB * sizeof(BoltDraw)));
+    memset(d->draw_h, 0, NB * sizeof(BoltDraw));
     {
         std::vector<const float*> rk(DL * NB), rv(DL * NB);
         for (int l = 0; l < DL; l++) for (size_t q = 0; q < NB; q++) { rk[l * NB + q] = d->sq[q].ck[l]; rv[l * NB + q] = d->sq[q].cv[l]; }
@@ -1015,6 +1086,17 @@ __global__ void gather_rows_k(const float* const* __restrict__ ptrs, float* __re
 }
 
 // dattn2_k's shared memory, allowed once (outside any capture)
+// BOLT_DRAFT_COUPLE (default 1): a sampled stream's drafts are drawn with the target's keyed noise (walk_k); 0 walks
+// greedily for every stream, 2 draws from the backbone's log-probabilities alone, 3 from the mean of both logits (both
+// measured worse than 1: 786 rounds for 2 against the greedy walk's 731 on eight prompts, 1,374 for 3 against 1,338 on
+// sixteen).
+int draft_couple() { static const int m = getenv("BOLT_DRAFT_COUPLE") ? atoi(getenv("BOLT_DRAFT_COUPLE")) : 1; return m; }
+// BOLT_DRAFT_NOISE weighs the keyed noise against the drafter's logits (1: the target's own draw; 0: the greedy walk).
+// The lattice is less sure of its candidates than the target is of its tokens, so the full noise moves the draft off
+// tokens the target keeps: over sixteen sampled prompts (4,574 tokens, 2026-11-16) the greedy walk took 1,478 rounds,
+// weights 0.25 / 0.35 / 0.5 / 0.7 / 1 took 1,377 / 1,361 / 1,338 / 1,348 / 1,390.
+float draft_noise() { static const float v = getenv("BOLT_DRAFT_NOISE") ? (float)atof(getenv("BOLT_DRAFT_NOISE")) : 0.5f; return v; }
+
 void dattn_opt() {
     static bool opted = false;
     if (!opted) { cudaFuncSetAttribute(dattn2_k, cudaFuncAttributeMaxDynamicSharedMemorySize, DA_SMEM); opted = true; }
@@ -1030,6 +1112,7 @@ void propose_body(Draft* d, int B, cudaStream_t s) {
     CK(cudaMemcpyAsync(d->pos_d, d->pos_h, d->nb * 4, cudaMemcpyHostToDevice, s));
     CK(cudaMemcpyAsync(d->anc_d, d->anc_h_tok, d->nb * 4, cudaMemcpyHostToDevice, s));
     CK(cudaMemcpyAsync(d->ancp, d->ancp_h, (size_t)B * sizeof(void*), cudaMemcpyHostToDevice, s));
+    CK(cudaMemcpyAsync(d->draw_d, d->draw_h, (size_t)B * sizeof(BoltDraw), cudaMemcpyHostToDevice, s));
     const int R = B * BLOCK;            // rows of all the blocks
     const int NN = B * NODES;           // lattice nodes of all the streams
     dmark("start");
@@ -1120,7 +1203,7 @@ void propose_body(Draft* d, int B, cudaStream_t s) {
     l2norm_k<<<B, 256, 0, s>>>(d->aout, VEPS);
     dmark("heads");
     static const int top1 = getenv("BOLT_DRAFT_TOP1") && atoi(getenv("BOLT_DRAFT_TOP1")) != 0;
-    walk_k<<<B, 256, 0, s>>>(d->aout, d->edges_out, d->edges_in, d->cids, d->out_dev, top1);
+    walk_k<<<B, 256, 0, s>>>(d->aout, d->edges_out, d->edges_in, d->cids, d->out_dev, top1, d->cvals, d->lse, d->draw_d, draft_couple(), draft_noise());
     dmark("walk");
     CK(cudaMemcpyAsync(d->out_host, d->out_dev, (size_t)B * SLOTS * 4, cudaMemcpyDeviceToHost, s));
 }
@@ -1136,7 +1219,7 @@ bool draft_graph_on() {
 // The launches for B streams are captured into a CUDA graph the first time B streams propose and replayed after that:
 // the pinned tables are read at replay, so a graph serves every later call with B streams; a capture that fails
 // turns the graph off and the call runs eagerly, with the same launches.
-void draft_propose_multi(Draft* d, int n, const int* seqs, const int* anchors, const int* pos, int* out, int* got, cudaStream_t s) {
+void draft_propose_multi(Draft* d, int n, const int* seqs, const int* anchors, const int* pos, int* out, int* got, cudaStream_t s, const BoltDraw* draws) {
     for (int i = 0; i < n; i++) got[i] = 0;
     if (!d || n < 1) return;
     // streams the drafter can serve now; the rest report 0
@@ -1155,6 +1238,7 @@ void draft_propose_multi(Draft* d, int n, const int* seqs, const int* anchors, c
         d->pos_h[b] = pos[idx[b]];
         d->anc_h_tok[b] = anchors[idx[b]];
         d->ancp_h[b] = q.anchor;
+        d->draw_h[b] = draws ? draws[idx[b]] : BoltDraw{};
     }
     if (dattn_tiled()) dattn_opt();
     cudaGraphExec_t exec = nullptr;

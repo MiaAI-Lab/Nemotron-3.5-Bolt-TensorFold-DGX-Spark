@@ -3,7 +3,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// The C ABI version of libbolt this backend speaks (`bolt_abi`).
-pub const abi_version: c_int = 3;
+pub const abi_version: c_int = 4;
 
 const windows = builtin.os.tag == .windows;
 /// libbolt.so on Linux, bolt.dll on Windows.
@@ -56,6 +56,10 @@ pub fn dlerror() ?[*:0]const u8 {
 /// A run of a prompt piece whose embeddings are rows on the device (bolt_prefill_seq_rows).
 pub const RowRun = extern struct { pos: c_int, count: c_int, rows: u64 };
 
+/// How a stream's target rows are drawn (BoltDraw): the keyed sampler's seed, the position the first draft's row is
+/// drawn at, and the temperature and top_p of the draw. temperature 0 is greedy.
+pub const Draw = extern struct { seed: u64 = 0, position: u64 = 0, temperature: f32 = 0, top_p: f32 = 0 };
+
 /// libbolt's C ABI, resolved once.
 pub const Api = struct {
     open: *const fn ([*:0]const u8, c_int) callconv(.c) ?*anyopaque,
@@ -73,8 +77,10 @@ pub const Api = struct {
     keep_multi: *const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int) callconv(.c) void,
     propose: *const fn (?*anyopaque, c_int, c_int, [*]c_int) callconv(.c) c_int,
     propose_multi: *const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int, [*]c_int, [*]c_int) callconv(.c) void,
+    propose_draws: *const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int, [*]const Draw, [*]c_int, [*]c_int) callconv(.c) void,
     has_draft: *const fn (?*anyopaque) callconv(.c) c_int,
     abi: *const fn () callconv(.c) c_int,
+    window: *const fn (?*anyopaque) callconv(.c) c_int,
     mask_rows: *const fn (?*anyopaque, c_int, [*]const c_int, [*]const u32, c_int, c_int) callconv(.c) c_int,
     prefill_rows: *const fn (?*anyopaque, c_int, [*]const c_int, c_int, c_int, [*]const RowRun, c_int) callconv(.c) c_int,
     cost: *const fn (?*anyopaque, c_int) callconv(.c) f64,
@@ -102,8 +108,10 @@ pub const Api = struct {
             .keep_multi = try sym(*const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int) callconv(.c) void, handle, "bolt_keep_multi"),
             .propose = try sym(*const fn (?*anyopaque, c_int, c_int, [*]c_int) callconv(.c) c_int, handle, "bolt_propose_seq"),
             .propose_multi = try sym(*const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int, [*]c_int, [*]c_int) callconv(.c) void, handle, "bolt_propose_multi"),
+            .propose_draws = try sym(*const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int, [*]const Draw, [*]c_int, [*]c_int) callconv(.c) void, handle, "bolt_propose_draws"),
             .has_draft = try sym(*const fn (?*anyopaque) callconv(.c) c_int, handle, "bolt_has_draft"),
             .abi = try sym(*const fn () callconv(.c) c_int, handle, "bolt_abi"),
+            .window = try sym(*const fn (?*anyopaque) callconv(.c) c_int, handle, "bolt_window"),
             .mask_rows = try sym(*const fn (?*anyopaque, c_int, [*]const c_int, [*]const u32, c_int, c_int) callconv(.c) c_int, handle, "bolt_mask_rows"),
             .prefill_rows = try sym(*const fn (?*anyopaque, c_int, [*]const c_int, c_int, c_int, [*]const RowRun, c_int) callconv(.c) c_int, handle, "bolt_prefill_seq_rows"),
             .cost = try sym(*const fn (?*anyopaque, c_int) callconv(.c) f64, handle, "bolt_cost"),

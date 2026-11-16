@@ -1,0 +1,182 @@
+diff --git a/zig/build/bolt.zig b/zig/build/bolt.zig
+new file mode 100644
+index 000000000..63eed4b8c
+--- /dev/null
++++ b/zig/build/bolt.zig
+@@ -0,0 +1,34 @@
++//! libbolt, Nemotron 3.5 Bolt's forward pass: an optional library nvcc builds beside the server from -Dbolt-src.
++
++const std = @import("std");
++
++const sources = [_][]const u8{ "bolt_kernels.cu", "bolt_mma.cu", "bolt_host.cu", "bolt_draft.cu" };
++
++/// `zig build bolt -Dnvcc=NVCC -Dbolt-src=DIR`: native/lib/libbolt.so, which a Bolt checkpoint opens.
++pub fn steps(b: *std.Build, nvcc: ?[]const u8) void {
++    const step = b.step("bolt", "libbolt (Nemotron 3.5 Bolt's engine, sm_121) from -Dbolt-src with -Dnvcc, beside the server");
++    const src = b.option([]const u8, "bolt-src", "the directory of libbolt's .cu sources (bolt_host.cu and its siblings)");
++    const tool = nvcc orelse {
++        step.dependOn(&b.addFail("zig build bolt needs -Dnvcc=PATH to nvcc").step);
++        return;
++    };
++    const dir = src orelse {
++        step.dependOn(&b.addFail("zig build bolt needs -Dbolt-src=DIR, the folder holding bolt_host.cu").step);
++        return;
++    };
++    const root: std.Build.LazyPath = .{ .cwd_relative = dir };
++    const windows = b.graph.host.result.os.tag == .windows;
++    const name = if (windows) "bolt.dll" else "libbolt.so";
++    const run = b.addSystemCommand(&.{ tool, "-shared", "-O3", "-gencode", "arch=compute_121a,code=sm_121a" });
++    // Windows: the shared UCRT (/MD) so the server's setenv reaches the library, MSVC's conforming preprocessor and
++    // M_SQRT2 for CUDA 13's headers, C++17 as gcc defaults to, and bolt.def naming the exports
++    if (windows) run.addArgs(&.{ "-std=c++17", "-Xcompiler=/MD,/Zc:preprocessor,/EHsc", "-D_USE_MATH_DEFINES" }) else run.addArgs(&.{ "-Xcompiler", "-fPIC" });
++    run.addArg("-I");
++    run.addDirectoryArg(root);
++    run.addArg("-o");
++    const lib = run.addOutputFileArg(name);
++    for (sources) |src_name| run.addFileArg(root.path(b, src_name));
++    run.addArg("-lcuda");
++    if (windows) run.addPrefixedFileArg("-Xlinker=/DEF:", root.path(b, "bolt.def"));
++    step.dependOn(&b.addInstallFile(lib, b.fmt("native/lib/{s}", .{name})).step);
++}
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 56b017519..568f59b0b 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -1,6 +1,7 @@
+ //! The CUDA half of the root build: kernel fatbins with their Python extensions' nvcc flags, the runtime, the CLI.
+ const std = @import("std");
+ const exlr8_build = @import("exlr8.zig");
++const bolt_build = @import("bolt.zig");
+ const catalog = @import("cuda_kernels.zig");
+ pub const Kernel = catalog.Kernel;
+ pub const kernels = catalog.kernels;
+@@ -56,6 +57,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const prebuilt = opts.fatbins;
+     const sms = opts.sms;
+     const strip = opts.strip;
++    bolt_build.steps(b, nvcc);
+     // the compiler's version text is an input of every fatbin, so a new nvcc rebuilds them all
+     const version: ?std.Build.LazyPath = if (prebuilt == null and nvcc != null) blk: {
+         const run = b.addSystemCommand(&.{ nvcc.?, "--version" });
+@@ -276,6 +278,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     }) });
+     bolt.dependOn(&compile_bolt.step);
+     step.dependOn(&compile_bolt.step);
++    // the libbolt lane backend (zig/src/families/nemotron/bolt_native.zig, copied in from a recipe) without a GPU or the library
++    const compile_lib = b.addObject(.{ .name = "bolt_lib_compile", .root_module = b.createModule(.{
++        .root_source_file = b.path("zig/tests/bolt_lib_compile.zig"),
++        .target = cuda_target,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "cuda", .module = check_cuda }, .{ .name = "nemotron", .module = check_mods.nemotron } },
++    }) });
++    b.step("compile-bolt-family", "Compile the libbolt lane backend (nemotron_h_puzzle) without a GPU").dependOn(&compile_lib.step);
+     for ([_]*std.Build.Module{ mods.nemotron, mods.lanes, mods.radio }) |m|
+         bolt.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+     const video_step = b.step("test-omni-video-host", "Actual RADIO and Bolt video boundaries without a GPU or decoder library");
+diff --git a/zig/src/cli/hub.zig b/zig/src/cli/hub.zig
+index 22ed74182..fea909b11 100644
+--- a/zig/src/cli/hub.zig
++++ b/zig/src/cli/hub.zig
+@@ -11,6 +11,7 @@ pub const Family = struct { model_type: []const u8, title: []const u8, formats:
+ const titles = [_]struct { model_type: []const u8, title: []const u8 }{
+     .{ .model_type = "nemotron_h", .title = "Nemotron 3.5 Lightning" },
+     .{ .model_type = "nemotron_h_omni", .title = "Nemotron 3.5 Super VL" },
++    .{ .model_type = "nemotron_h_puzzle", .title = "Nemotron 3.5 Bolt" },
+     .{ .model_type = "qwen4_exp", .title = "Qwen3.8 Flash Next" },
+     .{ .model_type = "glm5_next", .title = "GLM-5.3-Flash" },
+     .{ .model_type = "mistral3", .title = "Mistral3 wrapper (LightOnOCR-3-1B only)" },
+@@ -124,14 +125,18 @@ pub fn configInt(a: Allocator, io: std.Io, dir: []const u8, key: []const u8) ?u6
+     return if (v == .integer and v.integer >= 0) @intCast(v.integer) else null;
+ }
+ 
+-/// config.json's model_type, "unknown" when unreadable.
++/// config.json's model_type, "unknown" when unreadable; an omni wrapper of a puzzle model (Bolt) is nemotron_h_puzzle.
+ pub fn modelType(a: Allocator, io: std.Io, dir: []const u8) []const u8 {
+     const text = @import("checkpoint_config").optional(a, io, dir) orelse return "unknown";
+     var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch return "unknown";
+     defer parsed.deinit();
+     if (parsed.value != .object) return "unknown";
+     const t = parsed.value.object.get("model_type") orelse return "unknown";
+-    return if (t == .string) t.string else "unknown";
++    if (t != .string) return "unknown";
++    if (std.mem.eql(u8, t.string, "nemotron_h_omni")) if (parsed.value.object.get("llm_config")) |llm| if (llm == .object) {
++        if (llm.object.get("model_type")) |lt| if (lt == .string and std.mem.eql(u8, lt.string, "nemotron_h_puzzle")) return "nemotron_h_puzzle";
++    };
++    return a.dupe(u8, t.string) catch "unknown";
+ }
+ 
+ const ConfigDetails = struct { is_bolt: bool, modelopt_formats: ?[]const []const u8 = null };
+@@ -293,6 +298,12 @@ test "cache layout helpers read a synthetic cache" {
+     const snapshot = (try cachedSnapshot(a, io, hub, "Org/Name")).?;
+     try std.testing.expect(std.mem.endsWith(u8, snapshot, "0123456789abcdef0123456789abcdef01234567"));
+     try std.testing.expectEqualStrings("qwen4_exp", modelType(a, io, snapshot));
++    const cfg = try std.fs.path.join(a, &.{ snapshot, "config.json" });
++    try w.writeFile(io, .{ .sub_path = cfg, .data = "{\"model_type\": \"nemotron_h_omni\", \"llm_config\": {\"model_type\": \"nemotron_h_puzzle\"}}" });
++    try std.testing.expectEqualStrings("nemotron_h_puzzle", modelType(a, io, snapshot));
++    try w.writeFile(io, .{ .sub_path = cfg, .data = "{\"model_type\": \"nemotron_h_omni\", \"llm_config\": {\"model_type\": \"nemotron_h\"}}" });
++    try std.testing.expectEqualStrings("nemotron_h_omni", modelType(a, io, snapshot));
++    try w.writeFile(io, .{ .sub_path = cfg, .data = "{\"model_type\": \"qwen4_exp\", \"quantization\": {\"bits\": 6, \"group_size\": 32}, \"max_position_embeddings\": 65536}" });
+     const q = quantization(a, io, snapshot).?;
+     try std.testing.expectEqual(@as(u64, 6), q.bits);
+     try std.testing.expectEqual(@as(u64, 32), q.group);
+diff --git a/zig/src/families/nemotron/cuda.zig b/zig/src/families/nemotron/cuda.zig
+index 6221e18c2..d91616db0 100644
+--- a/zig/src/families/nemotron/cuda.zig
++++ b/zig/src/families/nemotron/cuda.zig
+@@ -36,6 +36,8 @@ pub const pages = @import("cuda_pages.zig");
+ pub const slide = @import("cuda_slide.zig");
+ pub const worker = @import("cuda_worker.zig");
+ pub const omni = @import("cuda_native_omni.zig");
++/// Nemotron 3.5 Bolt over libbolt (nemotron_h_puzzle): the lane backend a recipe copies in beside this file.
++pub const bolt = @import("bolt_native.zig");
+ pub const identity = @import("core").checkpoint_identity;
+ 
+ test {
+diff --git a/zig/src/native/cuda_families.zig b/zig/src/native/cuda_families.zig
+index de591b1b6..810710270 100644
+--- a/zig/src/native/cuda_families.zig
++++ b/zig/src/native/cuda_families.zig
+@@ -14,7 +14,7 @@ const dory = @import("dory");
+ const qwen3 = @import("qwen3_cuda");
+ 
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+-pub const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native, @import("dots_mocr_cuda").native, @import("lfm2_moe_cuda").native };
++pub const registry = .{ nemotron.native, nemotron.omni, nemotron.bolt, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native, @import("dots_mocr_cuda").native, @import("lfm2_moe_cuda").native };
+ pub const families: []const api.Family = blk: {
+     var out: [registry.len + 5]api.Family = undefined;
+     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats, .decision_formats = if (@hasDecl(F, "decision_formats")) F.decision_formats else &.{} };
+diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
+index 20f029cf7..417bca967 100644
+--- a/zig/src/server/main.zig
++++ b/zig/src/server/main.zig
+@@ -243,7 +243,12 @@ fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8, problem: *[]cons
+     const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return "unknown";
+     if (doc != .object) return "unknown";
+     const t = doc.object.get("model_type") orelse return "unknown";
+-    return if (t == .string) t.string else "unknown";
++    if (t != .string) return "unknown";
++    // an omni wrapper around a puzzle text model is Bolt, a family of its own
++    if (std.mem.eql(u8, t.string, "nemotron_h_omni")) if (doc.object.get("llm_config")) |llm| if (llm == .object) {
++        if (llm.object.get("model_type")) |lt| if (lt == .string and std.mem.eql(u8, lt.string, "nemotron_h_puzzle")) return "nemotron_h_puzzle";
++    };
++    return t.string;
+ }
+ 
+ /// The family's defaults, generation_config.json's sampling, then the serve flags (family_sampling.resolve).
+diff --git a/zig/tests/bolt_lib_compile.zig b/zig/tests/bolt_lib_compile.zig
+new file mode 100644
+index 000000000..a677fe857
+--- /dev/null
++++ b/zig/tests/bolt_lib_compile.zig
+@@ -0,0 +1,11 @@
++//! Generate the libbolt lane backend's open and vtable bodies (zig/src/families/nemotron/bolt_native.zig) without a GPU.
++const std = @import("std");
++const cuda = @import("cuda");
++const n = @import("nemotron");
++export fn boltLibCompile(ctx: *const cuda.Context, io: *const std.Io, path: [*:0]const u8, images: bool, lanes: u32) void {
++    const loaded = n.bolt.open(std.heap.page_allocator, io.*, ctx, std.mem.span(path), null, .{ .context = 256, .drafts = true, .lanes = lanes, .vision = if (images) .{ .image_tokens = 3328, .max_images = 1 } else null }) catch return;
++    defer loaded.deinit(loaded.ctx);
++    loaded.backend.vtable.verify(loaded.backend.ptr, &.{}, &.{}) catch {};
++    _ = n.bolt.snap_bytes(loaded.target, 1);
++    _ = n.bolt.explain(null, error.BoltLoad);
++}

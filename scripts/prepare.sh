@@ -101,11 +101,11 @@ if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built_hash" != "$PATCHES_HASH" ]]
 fi
 if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 && [[ $REBUILD -eq 0 ]] || { log "Pulling base image $BASE_IMAGE"; docker pull "$BASE_IMAGE"; }
-  log "Building $IMAGE (TensorFold ${TF_REF:0:12}, Zig $ZIG_VERSION, patches $PATCHES_HASH)"
+  log "Building $IMAGE (TensorFold ${TF_REF:0:12}, Zig $ZIG_VERSION, $TF_PATCHES $PATCHES_HASH)"
   ctx=$(mktemp -d "$STATE_DIR/build.XXXXXX")
   trap 'rm -rf -- "$ctx"' EXIT
   mkdir -p "$ctx/patches" "$ctx/engine"
-  compgen -G 'patches/*.patch' >/dev/null && cp -- patches/*.patch "$ctx/patches/"
+  compgen -G "$TF_PATCHES/*.patch" >/dev/null && cp -- "$TF_PATCHES"/*.patch "$ctx/patches/"
   cp -- engine/*.cu engine/*.h engine/*.inc engine/*.zig "$ctx/engine/"   # the sources only (engine/tools holds the microbenchmarks)
   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
   docker build "${nocache[@]}" -t "$IMAGE" --build-arg BASE_IMAGE="$BASE_IMAGE" \

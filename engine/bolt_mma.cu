@@ -1408,8 +1408,9 @@ __global__ void __launch_bounds__(256) attn_mma_part_k(const Ctl* __restrict__ c
                                                        KvView kvc, float* __restrict__ part, int splits, int T) {
     pdl_wait();
     const int sp = QFAST ? blockIdx.z : blockIdx.x, g = blockIdx.y, qb = QFAST ? blockIdx.x : blockIdx.z;
-    if (MULTI && qb >= ctl->nseg) return;
-    const int sgi = MULTI ? qb : 0;
+    if (MULTI && qb >= ctl->nqb) return;
+    const int sgi = MULTI ? ctl->qb_seg[qb] : 0;
+    const int off = MULTI ? ctl->qb_off[qb] : 0;                             // a window's block starts at this row of it
     const size_t seq = ctl->seg_seq[sgi];
     const int ctx = kvc.ctx;
     const bool fp8 = kvc.fp8;
@@ -1417,13 +1418,13 @@ __global__ void __launch_bounds__(256) attn_mma_part_k(const Ctl* __restrict__ c
     __shared__ __align__(16) uint16_t Ks[32 * FA_KS];
     __shared__ __align__(16) uint16_t Vt[128 * FA_VS];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gi = lane >> 2, ti = lane & 3;
-    const int row0 = MULTI ? ctl->seg_row0[sgi] : qb * FA_Q;                 // first query row of this CTA
-    const int nrow = MULTI ? ctl->seg_row0[sgi + 1] - row0 : min(T - qb * FA_Q, FA_Q);
+    const int row0 = MULTI ? ctl->seg_row0[sgi] + off : qb * FA_Q;           // first query row of this CTA
+    const int nrow = MULTI ? min(ctl->seg_row0[sgi + 1] - row0, FA_Q) : min(T - qb * FA_Q, FA_Q);
     const int t = row0 + warp;                                                // query row (global)
-    const int local = MULTI ? warp : qb * FA_Q + warp;                        // its position within the segment
+    const int local = MULTI ? off + warp : qb * FA_Q + warp;                  // its position within the segment
     const bool live = warp < nrow;
     const int len = live ? base0 + local + 1 : 0;
-    const int maxlen = base0 + (MULTI ? nrow : min(T, qb * FA_Q + FA_Q));
+    const int maxlen = base0 + (MULTI ? off + nrow : min(T, qb * FA_Q + FA_Q));
     const int chunk = MULTI ? win_chunk(base0) : ((maxlen + splits - 1) / splits + 31) / 32 * 32;
     const int p0 = sp * chunk, p1 = min(maxlen, p0 + chunk);
 
@@ -1541,7 +1542,8 @@ __global__ void attn_mma_comb_k(const Ctl* __restrict__ ctl, const float* __rest
         if (t >= ctl->nrows) { out[(size_t)t * 4096 + h * 128 + d] = 0.f; return; }   // padding row
         int sg = 0;
         while (sg + 1 < ctl->nseg && t >= ctl->seg_row0[sg + 1]) sg++;
-        qb = sg; w = t - ctl->seg_row0[sg];
+        const int wl = t - ctl->seg_row0[sg];
+        qb = ctl->seg_qb0[sg] + wl / FA_Q; w = wl % FA_Q;
     }
     const float* base = part + (size_t)((qb * 2 + g) * splits) * FA_PART + w * (32 + 16 * 128);
     float M = -1e30f;
@@ -1722,10 +1724,13 @@ void k_attn_mma(cudaStream_t s, const Ctl* ctl, const float* q, const KvView& kv
     }
     launch_pdl(attn_mma_comb_k<false>, dim3(T, 32), 128, 0, s, ctl, part, out, splits);
 }
-// Verify windows of up to nseg sequences (nseg a launch bound, ctl->nseg of them used), each of at most 8 rows.
+// Verify windows of up to nseg sequences (nseg a launch bound, ctl->nseg of them used), each of at most ctl->win rows:
+// a window is ctl's query blocks of FA_Q rows, one CTA each (T rows over nseg windows are at most (T + 7 nseg) / 8 blocks).
 void k_attn_mma_windows(cudaStream_t s, const Ctl* ctl, const float* q, const KvView& kv, float* part, float* out,
                         int T, int nseg, int splits) {
-    launch_pdl(attn_mma_part_k<true>, dim3(splits, 2, nseg), 256, 0, s, ctl, q, kv, part, splits, T);
+    static_assert(FA_Q == WIN_Q, "a window's query block is one CTA of the attention kernel");
+    const int most = (T + (FA_Q - 1) * nseg) / FA_Q, nqb = most < QB_MAX ? most : QB_MAX;
+    launch_pdl(attn_mma_part_k<true>, dim3(splits, 2, nqb), 256, 0, s, ctl, q, kv, part, splits, T);
     launch_pdl(attn_mma_comb_k<true>, dim3(T, 32), 128, 0, s, ctl, part, out, splits);
 }
 size_t attn_mma_part_floats(int T, int splits) { return (size_t)((T + FA_Q - 1) / FA_Q) * 2 * splits * FA_PART; }

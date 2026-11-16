@@ -5,10 +5,118 @@ Newest first. This recipe targets one DGX Spark. The image is `tensorfold-nemotr
 
 ## Unreleased
 
-The Bolt backend serves the checkpoint. Measured on one GB10 (this build, 2026-10-27): decode alone 74 tok/s greedy prose
-and 137 code with LiLiCorr (72 and 136 sampled; 4.3 to 36 without drafts), prefill 2,375 to 2,525 tok/s from 2.6k to
-42k tokens, 2,250 at 63k and 1,970 at 126k (NV4_FP4=0: about 7 % less); sixteen streams on one prompt 330 tok/s
-aggregate greedy prose, 507 code, 261 and 293 sampled; sixteen distinct prompts 301 greedy, 264 sampled.
+The Bolt backend serves the checkpoint. Measured on one GB10 (this build, 2026-11-16): decode alone 74 tok/s greedy prose
+and 136 code with LiLiCorr (76 and 139 sampled; 36 to 38 without drafts), a file rewrite 320 to 340 tok/s; prefill 2,400 to
+2,500 tok/s from 2.6k to 21k tokens, 2,360 at 42k, 2,250 at 63k and 1,970 at 126k (NV4_FP4=0: about 7 % less); sixteen
+streams on one prompt 362 tok/s aggregate greedy prose, 523 code, 282 and 317 sampled; sixteen distinct prompts 299
+greedy.
+
+### Keyed drafts, verify windows of up to 32 rows, the growth guard, and a build against TensorFold 1.2.9 (2026-11-16)
+
+Measured on dgx03 with a test server on its own port beside the serving one (which was idle during every run that
+counts: its token counter is read before and after), TensorFold's `tools/bench_concurrent.py` as before: N clients on
+one prompt, 256 tokens, medians of three, each concurrent reply's token hash checked against the request alone. The
+previous build (upstream `6b064a3`, the image `zig-eea9dc9` of that morning) and this one were measured back to back:
+
+| clients | sampled prose, before → now | sampled code | greedy prose | greedy code |
+| ---: | ---: | ---: | ---: | ---: |
+| ×1 | 71.0 → 76.0 (+7 %) | 133.9 → 139.0 (+4 %) | 73.6 → 73.5 | 137.9 → 136.4 |
+| ×8 | 207.9 → 228.6 (+10 %) | 249.0 → 267.7 (+8 %) | 310.2 → 315.5 | 463.3 → 464.4 |
+| ×16 | 262.3 → 281.8 (+7 %) | 291.6 → 317.1 (+9 %) | 327.9 → 362.4 | 504.8 → 523.3 |
+
+All 300 replies of the comparison hash the same in both builds, each concurrent reply equals its solo run, and the
+solo runs equal `"draft": false` (`--serial`). Greedy cells are level, as they must be (a greedy stream's drafts are
+what they were; the ×16 greedy prose cell varies by 10 % between runs of one build). Sixteen distinct prompts
+(`--prompts tools/bench_prompts.json`): all 144 concurrent replies equal their solo runs; sampled at ×8 213.9 → 224.7,
+greedy 236.2 → 239.6 at ×8 and 301.7 → 299.0 at ×16 (the sampled ×16 cell ran while the serving server was busy and is
+not quoted). Replies that repeat earlier text (`copybench.py`: 400 tokens, three runs, alone; windows of 8 rows → 32):
+
+| prompt | greedy | sampled | undrafted |
+| --- | ---: | ---: | ---: |
+| rewrite a 500-token Python file with one method renamed | 206 → 321 | 209 → 339 | 36.4 |
+| a JSON document with two values changed | 207 → 309 | 206 → 309 | 36.5 |
+| a paragraph copied with one word replaced throughout | 196 → 256 | 154 → 160 | 36.5 |
+| quote each method of the file, then explain it | 134 → 136 | 126 → 138 | 36.5 |
+
+Every one of those replies equals its `"draft": false` reply, as do copies at long context (`longcopy.py`: three
+sections copied out of documents of 3.9k, 4.0k, 8.1k and 16.3k tokens, greedy and sampled, 288 to 304 tok/s against
+36). Prefill is the same code and speed (2,444 to 2,516 tok/s at 2.6k and 5.3k tokens, 2,478 at 21k, 2,358 at 42k,
+2,245 at 63k, 1,966 at 126k).
+
+- **A sampled stream's drafts are drawn with its own keyed noise** (`walk_k` in `engine/bolt_draft.cu`,
+  `BOLT_DRAFT_COUPLE`, default 1; libbolt's `bolt_propose_draws`). TensorFold draws a sampled row as the token with the
+  largest `logit / temperature + noise` in the row's nucleus, the noise keyed by the request's seed, the row's position
+  and the token, so the walk through LiLiCorr's lattice can draw with the same noise: at each slot it takes the
+  candidate with the largest `8 · cosine / temperature + 0.5 · noise` (the lattice's edge logit at the checkpoint's
+  `lilicorr_logit_scale`, the noise of the position that slot's row will be drawn at), among the candidates `top_p` would
+  keep. The draft then follows the target to its second choice where the drafter's best guess would have missed. On
+  sixteen seeded prompts (4,574 tokens, temperature 1, the replies identical in every setting) the greedy walk took
+  1,478 rounds, the keyed one 1,338: 76.4 → 83.4 tok/s alone. The noise weight (`BOLT_DRAFT_NOISE`) was swept: 1,377
+  rounds at 0.25, 1,361 at 0.35, 1,338 at 0.5, 1,348 at 0.7, 1,390 at 1; the backbone's own log-probabilities instead of
+  the lattice's edges were worse than the greedy walk, and the neighbouring position's noise much worse (which checks
+  the position). A greedy stream (temperature 0, or `top_k` 1) walks as before. Drafts are proposals: the target draws
+  every row, so only the rounds a reply takes change.
+- **Verify windows of up to 32 rows** (`WINDOW`, default 32; `BOLT_WINDOW` in libbolt, whose own default stays 8;
+  `bolt_window` tells the backend). The round loop already drafts a copy when a reply repeats earlier text and doubles
+  one that landed whole, but a window held eight rows, so a rewrite kept seven drafts a round. The window is now a
+  setting of the loaded model: the conv ring has a slot a row (`WINDOW` + 1), the lazy state's saved scan inputs two
+  slots of `WINDOW` rows, and the window attention (`attn_mma_part_k`), the one kernel with eight rows built in, runs a
+  window as query blocks of eight rows, one CTA each, over the same key chunks (`Ctl.qb_seg`, `qb_off`, `seg_qb0`; a
+  window that starts within its width of the 32nd chunk's end launches a 33rd, and the graph key has room for it). A
+  window of up to eight rows is one block and computes what it did. A stream holds 0.46 GiB of state from load at 32
+  rows, 0.33 at 16, 0.28 at 8 (sixteen streams: 2.9 GiB more than before), and the load-time calibration times every
+  width (24.9 ms for one row, 33.2 for 8, 42.2 for 16, 57.2 for 32), with an entry above a later one set to it (a slow
+  run would make the planner shun that width).
+- **A growing stream is refused only when memory is really short** (`kv_room` in `engine/bolt_host.cu`). The guard that
+  keeps `BOLT_KV_RESERVE_GIB` (3) free when a stream maps its next 4,096 tokens of attention cache read the driver's
+  free memory, which on a Spark is the kernel's free pages without the page cache. After image builds on the machine,
+  with a second server loaded beside it, the serving server refused a 100,951-token prompt its next granule 1,445
+  tokens into the reply (`no memory to grow sequence 0 past 102400 tokens (2.6 GiB free)`, the request ended with
+  `BoltForward`) while `MemAvailable` stood near 40 GiB, and the test server refused every prompt over 4,096 tokens.
+  The guard now takes the larger of the driver's figure and `MemAvailable`.
+- **The backend source builds against TensorFold 1.1.6 and 1.2.9.** `patches/tf-1.2.9/0002-register-bolt.patch` is the
+  registration for v1.2.9 (`6b9de695`, 2026-11-14, 3,654 commits on): the CUDA families moved to
+  `zig/src/native/cuda_families.zig`, the rest of the patch is what it was. The lane core's two differences the backend
+  meets are resolved at compile time: `prefill_step` takes the host's row cap as a third argument, and `Model.copy_first`
+  exists, which the backend sets (the proposal is a pass of its own, so a stream whose next window a copy takes is asked
+  for no drafts). `TF_REF=6b9de695104b6b8b30c20458da87ac06c9480289 TF_PATCHES=patches/tf-1.2.9 ./start.sh` builds it
+  (`scripts/prepare.sh` copies the patches of `TF_PATCHES`, default `patches`). **The pin stays at 1.1.6**, for what was
+  measured with the same engine on both:
+  - Decode speed is the same: ten of twelve standard cells within 2 %, two eight-stream cells 3 to 7 % lower in the one
+    run. With `copy_first` a copy round runs no proposal: the rewrite prompt 381 tok/s greedy and 383 sampled against
+    321 and 339 on 1.1.6, the JSON edit 353 against 309, the paragraph 284 against 256 (the same afternoon, every
+    reply equal to its `"draft": false` reply).
+  - A non-zero `presence_penalty` or `frequency_penalty` is refused with a 400 (TensorFold #2166: an engine that applies
+    no penalties says so); 1.1.6 serves the request without the penalty. This backend applies none.
+  - Under prompt-cache pressure a reply can differ from the same request alone. 1.2.9 reserves cache room for
+    concurrent requests and drops the save points that do not fit (`trimmed` in the cache's log line); a save point is
+    where the prompt pass is cut, and this engine's prompt pass rounds differently for different cuts (a piece of up to
+    32 rows, one of 33 to 255 and one of 256 or more run different GEMM, attention and scan kernels). With a 2 GiB
+    cache and sixteen distinct prompts at once, 7 of 48 sampled and 3 of 48 greedy replies differed from their solo
+    runs with the unchanged engine on 1.2.9 (2 and 2 with this one); one was traced: a 52-token prompt resumed at
+    token 8 both times, prefilled as 38 + 6 rows alone and as 44 rows in company, first different token the 50th. With
+    the cache off all 48 match; 1.1.6 with the same 2 GiB cache keeps its cuts and all 48 match; and 1.2.9 with a cache
+    that holds the sixteen prompts' states (4 GiB: 14 states, 2.6 GiB, `trimmed 0`) matches in all 96 (sampled 288 tok/s,
+    greedy 300). So it takes more concurrent new prompts than `PROMPT_CACHE_GIB` has room for, about forty short ones
+    or a few very long ones at the default 8.
+  - What else 1.2.9 brings (upstream's figures, other families, not measured here): the prompt cache under many
+    conversations (#2699), resumed turns ranked by their uncached tail (#2276), a faster tokenizer memo (#2509), the
+    lane host failing only the streams a failed round held (#2727).
+- **libbolt's C ABI is 4**: `bolt_propose_draws` (drafts with each stream's `BoltDraw`: seed, first position,
+  temperature, top_p) and `bolt_window`; both are in `engine/bolt.def`. The Windows build (docs/windows.md) was not
+  rebuilt.
+- **Tried and not kept.** Shared rounds without drafts from twelve streams up (TensorFold 1.2's `plain_streams`): 205
+  tok/s on sixteen distinct prompts against 291 sampled and 300 greedy with drafts. A real round of sixteen one-row
+  windows takes 76 ms, not the 41 the load-time table says (the calibration never commits a Mamba state; stage profile
+  in `docs/speed-research.md`), and the planner, which learns the difference as overhead, was right to draft.
+- Checked on the Spark: both images were built by `scripts/prepare.sh` itself (as `bolt-final:116` and
+  `bolt-final:129`, with a state directory of their own, the serving image and container untouched); the growth-guard
+  change was compiled into libbolt afterwards and mounted over the image's for the paired table, the copy and
+  long-context runs and the 1.2.9 runs above, and the default image was then built once more from the final source.
+  `./start.sh` with the default image as a second server (two streams, `VISION=1`, port 8001) loaded, passed its own
+  smoke request, and answered: plain text; a picture (a PNG half red, half blue: "The left half is red and the right
+  half is blue."); `response_format` `json_schema` greedy and sampled; `tool_choice` `"required"` (a `get_time` call
+  for Vienna); a request with `presence_penalty` 0.5 (served, the penalty not applied, as before on 1.1.6).
 
 ### TensorFold 1.1.6
 
